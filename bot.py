@@ -5,6 +5,8 @@ import queue
 import random
 import sys
 import threading
+import time
+from array import array
 
 q = queue.Queue()
 
@@ -26,6 +28,12 @@ HP_AVOID = 0.8    # avoid an enemy whose HP is more than 1/0.8 = 1.25x ours
 FLEE_KEEP_S = 3.0  # keep running from the last threat this long after losing sight of it
 HOP_ON_HIT = True  # hop while fleeing when shot (weak: our hitbox is 9 m tall; set False to disable)
 flee_mem = {"until": 0.0, "from": None}
+COVER_RADII = (10.0, 20.0, 35.0, 50.0, 70.0)   # how far from us to look for cover (m)
+COVER_ANGLES = 24                  # directions tried per radius
+HEAL_HOLD_S = 25.0  # after a retreat, wait in cover this long (or until ~90% HP)
+cover = {"pt": None, "plan_t": -99.0, "hold_until": 0.0, "hidden": False}
+dodge = {"until": 0.0, "side": 1}
+MAP = {"ok": False}
 mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0}
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
@@ -269,6 +277,221 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
     return False
 
 
+# ----------------------------------------------------------------------------
+# Map: terrain heights + building prisms (v2/world.json, v2/terrain.i16)
+# ----------------------------------------------------------------------------
+CELL = 32.0
+
+
+def pip(x, y, pts):
+    """Point in polygon (ray casting)."""
+    inside = False
+    j = len(pts) - 1
+    for i in range(len(pts)):
+        xi, yi = pts[i]
+        xj, yj = pts[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-9) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _pairs(flat):
+    if flat and isinstance(flat[0], (list, tuple)):
+        return [(p[0], p[1]) for p in flat]
+    return list(zip(flat[0::2], flat[1::2]))
+
+
+def load_map(hello):
+    try:
+        d = hello["map"]["dir"]
+        with open(os.path.join(d, "v2", "world.json")) as f:
+            w = json.load(f)
+        t = w["terrain"]
+        arr = array("h")
+        with open(os.path.join(d, "v2", "terrain.i16"), "rb") as f:
+            arr.frombytes(f.read())
+        if sys.byteorder == "big":
+            arr.byteswap()
+        nx, ny = int(t["nx"]), int(t["ny"])
+        if len(arr) < nx * ny:
+            raise ValueError("terrain file too small")
+        prisms, grid = [], {}
+        for pr in w.get("prisms", []):
+            pts = _pairs(pr["ring"])
+            if len(pts) < 3:
+                continue
+            hraw = pr.get("holes") or []
+            if hraw and isinstance(hraw[0], (int, float)):
+                hraw = [hraw]                          # a single flat ring
+            holes = [_pairs(h) for h in hraw if h]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            idx = len(prisms)
+            prisms.append((min(xs), min(ys), max(xs), max(ys), pr["base"], pr["top"], pts, holes))
+            for gx in range(int(min(xs) // CELL), int(max(xs) // CELL) + 1):
+                for gy in range(int(min(ys) // CELL), int(max(ys) // CELL) + 1):
+                    grid.setdefault((gx, gy), []).append(idx)
+        MAP.update(ok=True, arr=arr, nx=nx, ny=ny, minX=float(t["minX"]), minY=float(t["minY"]),
+                   step=float(t.get("step", 1.0)), prisms=prisms, grid=grid)
+        print("map loaded: %d prisms, terrain %dx%d" % (len(prisms), nx, ny), file=sys.stderr)
+    except Exception as e:
+        MAP["ok"] = False
+        print("map NOT loaded (retreat uses plain flee):", repr(e), file=sys.stderr)
+
+
+def in_terrain(x, y):
+    m = MAP
+    return (m["minX"] <= x <= m["minX"] + (m["nx"] - 1) * m["step"]
+            and m["minY"] <= y <= m["minY"] + (m["ny"] - 1) * m["step"])
+
+
+def ground(x, y):
+    m = MAP
+    nx, ny = m["nx"], m["ny"]
+    fx = min(max((x - m["minX"]) / m["step"], 0.0), nx - 1.001)
+    fy = min(max((y - m["minY"]) / m["step"], 0.0), ny - 1.001)
+    i, j = int(fx), int(fy)
+    tx, ty = fx - i, fy - j
+    a, b = m["arr"], j * nx + i
+    return ((a[b] * (1 - tx) + a[b + 1] * tx) * (1 - ty)
+            + (a[b + nx] * (1 - tx) + a[b + nx + 1] * tx) * ty) / 100.0
+
+
+def ground_z(x, y, default):
+    return ground(x, y) if MAP["ok"] and in_terrain(x, y) else default
+
+
+def inside_prism(x, y, z):
+    for idx in MAP["grid"].get((int(x // CELL), int(y // CELL)), ()):
+        x0, y0, x1, y1, base, top, pts, holes = MAP["prisms"][idx]
+        if x < x0 or x > x1 or y < y0 or y > y1 or z < base or z > top:
+            continue
+        if pip(x, y, pts) and not any(pip(x, y, h) for h in holes):
+            return True
+    return False
+
+
+def los_blocked(a, b):
+    """True if terrain or a building is between points a and b (trees ignored: unreliable cover)."""
+    dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+    n = max(2, int(math.sqrt(dx * dx + dy * dy + dz * dz) / 1.5))
+    for k in range(1, n):
+        f = k / n
+        x, y, z = a[0] + dx * f, a[1] + dy * f, a[2] + dz * f
+        if in_terrain(x, y) and z < ground(x, y):
+            return True
+        if inside_prism(x, y, z):
+            return True
+    return False
+
+
+def solid_at(x, y):
+    g = ground(x, y)
+    return inside_prism(x, y, g + 1.5) or inside_prism(x, y, g + 8.5)
+
+
+def path_clear(ax, ay, bx, by, max_len=None):
+    full = math.hypot(bx - ax, by - ay) or 1.0
+    d = min(full, max_len) if max_len is not None else full
+    n = max(1, int(d / 2.0))
+    ux, uy = (bx - ax) / full, (by - ay) / full
+    for k in range(1, n + 1):
+        x, y = ax + ux * 2.0 * k, ay + uy * 2.0 * k
+        if not in_terrain(x, y) or solid_at(x, y):
+            return False
+    return True
+
+
+def plan_cover(o, me, threats, cx, cy, nr, force=False):
+    """Pick a nearby spot hidden from every threat (else the farthest reachable one)."""
+    if not MAP["ok"] or not threats:
+        return None
+    now = o["t"]
+    if (not force) and cover["pt"] is not None and now - cover["plan_t"] < 0.8:
+        return cover["pt"]
+    t0 = time.perf_counter()
+    px, py, pz = me["pos"]
+    sz = 1 + 0.05 * me.get("cubes", 0)
+    thr = sorted(threats, key=lambda t: math.hypot(t[0] - px, t[1] - py))[:2]
+    d0 = math.hypot(thr[0][0] - px, thr[0][1] - py)
+    best_h = best_f = None
+    for r in COVER_RADII:
+        for k in range(COVER_ANGLES):
+            if time.perf_counter() - t0 > 0.02:
+                break                                   # keep inside the 50 ms decision budget
+            a = k * 2 * math.pi / COVER_ANGLES
+            x, y = px + r * math.cos(a), py + r * math.sin(a)
+            if math.hypot(x - cx, y - cy) > 0.85 * nr or not in_terrain(x, y) or solid_at(x, y):
+                continue
+            dt = min(math.hypot(x - t[0], y - t[1]) for t in thr)
+            if dt < d0 - 5:
+                continue                                # never retreat toward the threat
+            if not path_clear(px, py, x, y):
+                continue
+            g = ground(x, y)
+            hidden = all(los_blocked(t, (x, y, g + 4.5 * sz)) and los_blocked(t, (x, y, g + 9 * sz))
+                         for t in thr)
+            if hidden:
+                cost = r + 0.3 * max(0.0, 80.0 - dt)
+                if best_h is None or cost < best_h[0]:
+                    best_h = (cost, (x, y))
+            else:
+                far = dt - 0.2 * r
+                if best_f is None or far > best_f[0]:
+                    best_f = (far, (x, y))
+    pick = best_h or best_f
+    cover["plan_t"] = now
+    cover["pt"] = pick[1] if pick else None
+    cover["hidden"] = best_h is not None
+    return cover["pt"]
+
+
+def retreat_vec(o, me, threats, cx, cy, nr):
+    """Move vector toward cover, [0,0] when already there, None if no plan (caller falls back)."""
+    pt = plan_cover(o, me, threats, cx, cy, nr)
+    if pt is None:
+        return None
+    dx, dy = pt[0] - me["pos"][0], pt[1] - me["pos"][1]
+    d = math.hypot(dx, dy)
+    return [0, 0] if d < 3.0 else [dx / d, dy / d]
+
+
+def laser_dodge(o, me, enemies):
+    """Sidestep (boosted) when an enemy's charging laser is lined up on us."""
+    px, py = me["pos"][0], me["pos"][1]
+    now = o["t"]
+    near = None
+    for m in enemies:
+        if not m.get("charging"):
+            continue
+        dx, dy = px - m["pos"][0], py - m["pos"][1]
+        d = math.hypot(dx, dy) or 1.0
+        if d < 290 and abs(wrap(m["aim"][0] - math.atan2(dy, dx))) < math.atan2(4.0, d) + 0.08:
+            if near is None or d < near[0]:
+                near = (d, m)
+    if near is None:
+        return None
+    m = near[1]
+    ux, uy = math.cos(m["aim"][0]), math.sin(m["aim"][0])
+    if now > dodge["until"]:                    # pick a side at the start of a dodge, then commit
+        best_side, best_free = dodge["side"], -1.0
+        for side in (1, -1):
+            vx, vy = -uy * side, ux * side
+            free = 12.0
+            if MAP["ok"]:
+                free = 0.0
+                while free < 12.0 and in_terrain(px + vx * (free + 2), py + vy * (free + 2)) \
+                        and not solid_at(px + vx * (free + 2), py + vy * (free + 2)):
+                    free += 2.0
+            if free > best_free:
+                best_side, best_free = side, free
+        dodge["side"] = best_side
+    dodge["until"] = now + 0.5
+    s = dodge["side"]
+    return [-uy * s, ux * s]
+
+
 def mobility(o, me, act, want_up, fleeing, hit_now):
     """Jump when we are pushing against something and not moving; jet if the goal is higher."""
     now = o["t"]
@@ -385,10 +608,23 @@ def decide(o):
                     fy += 0.8 * (cy - py) / zd
                     fn = math.hypot(fx, fy) or 1.0
                     fx, fy = fx / fn, fy / fn
-                act["move"] = [fx, fy]
+                tl = [(m["pos"][0], m["pos"][1], m["pos"][2] + 8 * (1 + 0.05 * m.get("cubes", 0)))
+                      for m in threats]
+                rv = retreat_vec(o, me, tl, cx, cy, z["next_radius"])
+                if rv is not None:
+                    cover["hold_until"] = now + HEAL_HOLD_S
+                act["move"] = rv if rv is not None else [fx, fy]
             elif me["hp"] < 0.35 * me["max_hp"]:
                 fleeing = True
-                act["move"] = [-dx / dist, -dy / dist]
+                flee_mem["until"] = now + FLEE_KEEP_S
+                flee_mem["from"] = (t["pos"][0], t["pos"][1])
+                tl = [(m["pos"][0], m["pos"][1], m["pos"][2] + 8 * (1 + 0.05 * m.get("cubes", 0)))
+                      for m in enemies
+                      if m is t or math.hypot(m["pos"][0] - px, m["pos"][1] - py) < 150]
+                rv = retreat_vec(o, me, tl, cx, cy, z["next_radius"])
+                if rv is not None:
+                    cover["hold_until"] = now + HEAL_HOLD_S
+                act["move"] = rv if rv is not None else [-dx / dist, -dy / dist]
             else:
                 want_up = t["pos"][2] - pz > 1.5       # enemy on higher ground: climb if blocked
                 side = 1 if (o["tick"] // 15) % 2 else -1  # flip every 1.5 s
@@ -406,19 +642,45 @@ def decide(o):
                     act["move"] = [mx / n, my / n]
                 else:
                     act["move"] = [sx, sy]
+        dv = laser_dodge(o, me, enemies)
+        if dv is not None:                  # a charging laser is lined up on us: sprint sideways
+            act["move"] = dv
+            if me["energy"] > 25:
+                act["boost"] = True
     else:
+        # shot by a mech we cannot see: treat the bearing as a threat and take cover
+        if inside:
+            for e in o.get("events", []):
+                if (e.get("type") == "damaged" and e.get("bearing") is not None
+                        and e.get("by") is not None and e["by"] < 16):   # ids 0-15 are mechs
+                    flee_mem["until"] = now + FLEE_KEEP_S
+                    flee_mem["from"] = (px + 80 * math.cos(e["bearing"]),
+                                        py + 80 * math.sin(e["bearing"]))
+                    cover["plan_t"] = -99.0               # force a fresh plan
+                    cover["hold_until"] = now + HEAL_HOLD_S
         if inside and flee_mem["from"] is not None and now < flee_mem["until"]:
-            # lost sight of a threat: keep running from where it was instead of walking back
+            # lost sight of a threat: go to cover (or keep running from where it was)
             fleeing = True
-            fx, fy = px - flee_mem["from"][0], py - flee_mem["from"][1]
-            fn = math.hypot(fx, fy) or 1.0
-            fx, fy = fx / fn, fy / fn
-            if zd > 0.6 * z["next_radius"]:
-                fx += 0.8 * (cx - px) / zd
-                fy += 0.8 * (cy - py) / zd
+            gx, gy = flee_mem["from"]
+            rv = retreat_vec(o, me, [(gx, gy, ground_z(gx, gy, pz) + 8)], cx, cy, z["next_radius"])
+            if rv is None:
+                fx, fy = px - gx, py - gy
                 fn = math.hypot(fx, fy) or 1.0
                 fx, fy = fx / fn, fy / fn
-            act["move"] = [fx, fy]
+                if zd > 0.6 * z["next_radius"]:
+                    fx += 0.8 * (cx - px) / zd
+                    fy += 0.8 * (cy - py) / zd
+                    fn = math.hypot(fx, fy) or 1.0
+                    fx, fy = fx / fn, fy / fn
+                rv = [fx, fy]
+            act["move"] = rv
+            acted = True
+        elif (inside and cover["pt"] is not None and now < cover["hold_until"]
+              and me["hp"] < 0.9 * me["max_hp"]):
+            # heal in cover: walk to the spot and wait there (regen needs ~5 s without damage)
+            ddx, ddy = cover["pt"][0] - px, cover["pt"][1] - py
+            dd = math.hypot(ddx, ddy)
+            act["move"] = [ddx / dd, ddy / dd] if dd > 3.0 else [0, 0]
             acted = True
         else:
             acted = loot(o, me, act, held, z, cx, cy) if inside else False
@@ -450,8 +712,9 @@ def main():
         return
     CFG = hello.get("config", {})
     RNG = random.Random(hello.get("seed", 0))
+    load_map(hello)
     if LOG:
-        LOG.write(json.dumps({"hello": hello}) + "\n")
+        LOG.write(json.dumps({"hello": hello, "map_ok": MAP["ok"]}) + "\n")
         LOG.flush()
     send({"type": "ready", "name": "simple-bot"})
 
