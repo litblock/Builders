@@ -18,8 +18,15 @@ RNG = random.Random(0)
 known = {}       # weapon pickup id -> pickup dict (remembered after it leaves view)
 known_cubes = {}  # cube id -> {"c": cube dict, "t": last seen match time}
 ignore = {}      # (type, id) -> match time until which we skip that target
-chase = {"key": None, "best": 1e9, "t": 0.0, "start": 0.0}
+chase = {"key": None, "best": 1e9, "t": 0.0, "start": 0.0, "tz": None}
 wander = {"pt": None, "until": 0.0}
+
+EARLY_S = 120     # "early game": avoid fights against healthier enemies before this match time
+HP_AVOID = 0.8    # avoid an enemy whose HP is more than 1/0.8 = 1.25x ours
+FLEE_KEEP_S = 3.0  # keep running from the last threat this long after losing sight of it
+HOP_ON_HIT = True  # hop while fleeing when shot (weak: our hitbox is 9 m tall; set False to disable)
+flee_mem = {"until": 0.0, "from": None}
+mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0}
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
 # Upgrade ranking by id (higher = better), from the real hello.config.upgrades list.
@@ -170,6 +177,7 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
     """Weapon pickups > cubes > NPC/crate farming > wander. Returns True if it acted."""
     px, py, pz = me["pos"]
     now = o["t"]
+    chase["tz"] = None
     need_weapon = me["weapons"][1] is None
     safe_r = 0.9 * z["next_radius"]
 
@@ -210,6 +218,7 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
         cands.sort(key=lambda c: c[0])
         _, key, tgt, kind, standoff = cands[0]
         tpos = tgt["pos"]
+        chase["tz"] = tpos[2]
         dx, dy = tpos[0] - px, tpos[1] - py
         d = math.hypot(dx, dy) or 1.0
 
@@ -260,6 +269,31 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
     return False
 
 
+def mobility(o, me, act, want_up, fleeing, hit_now):
+    """Jump when we are pushing against something and not moving; jet if the goal is higher."""
+    now = o["t"]
+    mv = act.get("move", [0, 0])
+    wants_move = math.hypot(mv[0], mv[1]) > 0.5
+    spd = math.hypot(me["vel"][0], me["vel"][1])
+    if me["grounded"]:
+        if wants_move and spd < 2.0:
+            mob["blocked"] += 1
+        else:
+            mob["blocked"] = 0
+        if now >= mob["jump_cd"]:
+            if mob["blocked"] >= 4:                  # ~0.4 s of pushing without moving
+                act["jump"] = True
+                mob["jump_cd"] = now + 1.0
+                mob["blocked"] = 0
+                if want_up:
+                    mob["climb_until"] = now + 1.2
+            elif HOP_ON_HIT and fleeing and hit_now and spd > 4.0:
+                act["jump"] = True
+                mob["jump_cd"] = now + 2.0
+    elif now < mob["climb_until"] and me["energy"] > 25:
+        act["boost"] = True                          # in the air: jet until the feet clear the edge
+
+
 def decide(o):
     me = o["self"]
     px, py, pz = me["pos"]
@@ -270,6 +304,11 @@ def decide(o):
         act["pick"] = pick_upgrade(o["offer"], held, me)
 
     update_memory(o, px, py, pz)
+    now = o["t"]
+    hit_now = any(e.get("type") == "damaged" and e.get("by") is not None
+                  for e in o.get("events", []))
+    fleeing = False
+    want_up = False
 
     # --- zone: head for the next circle, stop once well inside it ---
     z = o["zone"]
@@ -292,6 +331,12 @@ def decide(o):
         dist = math.hypot(dx, dy) or 1.0
         speed = gun["stats"]["speed"] if gun else 252
         kind1 = w1["kind"] if w1 else None
+
+        # early game: avoid enemies that are healthier than us (needs enemy hp in obs)
+        threats = [m for m in enemies
+                   if m.get("hp") is not None and me["hp"] < HP_AVOID * m["hp"]
+                   and math.hypot(m["pos"][0] - px, m["pos"][1] - py) < 150]
+        avoid = o["t"] < EARLY_S and bool(threats)
 
         yaw_direct = math.atan2(dy, dx)
         yaw_err = abs(wrap(yaw_direct - me["aim"][0]))
@@ -321,13 +366,31 @@ def decide(o):
         else:
             fire0 = abs(wrap(yaw - me["aim"][0])) < 0.1
             firing_gun = fire0
+        if avoid and dist >= 40:       # don't provoke or reset regen unless they are on top of us
+            fire0 = fire1 = False
         act["fire"] = [fire0, fire1]
 
         # strafe, close in with lightning, or back off when low on HP
         if inside:
-            if me["hp"] < 0.35 * me["max_hp"]:
+            if avoid:
+                fleeing = True
+                tt = min(threats, key=lambda m: math.hypot(m["pos"][0] - px, m["pos"][1] - py))
+                flee_mem["until"] = now + FLEE_KEEP_S
+                flee_mem["from"] = (tt["pos"][0], tt["pos"][1])
+                fx, fy = px - tt["pos"][0], py - tt["pos"][1]
+                fn = math.hypot(fx, fy) or 1.0
+                fx, fy = fx / fn, fy / fn
+                if zd > 0.6 * z["next_radius"]:        # keep drifting toward the circle center
+                    fx += 0.8 * (cx - px) / zd
+                    fy += 0.8 * (cy - py) / zd
+                    fn = math.hypot(fx, fy) or 1.0
+                    fx, fy = fx / fn, fy / fn
+                act["move"] = [fx, fy]
+            elif me["hp"] < 0.35 * me["max_hp"]:
+                fleeing = True
                 act["move"] = [-dx / dist, -dy / dist]
             else:
+                want_up = t["pos"][2] - pz > 1.5       # enemy on higher ground: climb if blocked
                 side = 1 if (o["tick"] // 15) % 2 else -1  # flip every 1.5 s
                 cubes_near = [r["c"] for r in known_cubes.values()
                               if math.hypot(r["c"]["pos"][0] - px, r["c"]["pos"][1] - py) < 15
@@ -344,7 +407,22 @@ def decide(o):
                 else:
                     act["move"] = [sx, sy]
     else:
-        acted = loot(o, me, act, held, z, cx, cy) if inside else False
+        if inside and flee_mem["from"] is not None and now < flee_mem["until"]:
+            # lost sight of a threat: keep running from where it was instead of walking back
+            fleeing = True
+            fx, fy = px - flee_mem["from"][0], py - flee_mem["from"][1]
+            fn = math.hypot(fx, fy) or 1.0
+            fx, fy = fx / fn, fy / fn
+            if zd > 0.6 * z["next_radius"]:
+                fx += 0.8 * (cx - px) / zd
+                fy += 0.8 * (cy - py) / zd
+                fn = math.hypot(fx, fy) or 1.0
+                fx, fy = fx / fn, fy / fn
+            act["move"] = [fx, fy]
+            acted = True
+        else:
+            acted = loot(o, me, act, held, z, cx, cy) if inside else False
+            want_up = acted and chase["tz"] is not None and chase["tz"] - pz > 1.0
         if "fire" in act:
             firing_gun = act["fire"][0]
         if not acted:
@@ -353,6 +431,8 @@ def decide(o):
                     if e.get("type") == "damaged" and e.get("bearing") is not None]
             if hits:
                 act["aim"] = [hits[-1]["bearing"], 0]
+
+    mobility(o, me, act, want_up, fleeing, hit_now)
 
     # reload when empty, or when idle and under half a magazine
     if gun and gun["reload"] == 0 and (
