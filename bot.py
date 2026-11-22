@@ -38,8 +38,10 @@ mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0,
 nav = {"side": 1, "until": 0.0, "last_pos": None, "stuck": 0, "last_t": -1.0}
 route = {"key": None, "goal": None, "waypoints": deque(), "retry": 0.0,
          "best": math.inf, "progress": 0.0, "next_limit": 0.0}
-recent_attackers = {}
-crossfire = {"target": None, "target_pos": None, "target_until": 0.0, "retreat_until": 0.0}
+weapon_sounds = deque(maxlen=10)
+SOUND_MEMORY = 0.9
+SOUND_STRENGTH = {"gun": 0.65, "mortar": 0.9, "laser": 1.0,
+                  "laser_charge": 1.0, "lightning": 0.9}
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
 # Upgrade ranking by id (higher = better), from the real hello.config.upgrades list.
@@ -349,12 +351,6 @@ def reload_gun(me, act):
                 act["reload"] = True
 
 
-def remember_engagement(now, act, target):
-    if any(act["fire"]):
-        crossfire.update(target=target["id"], target_pos=tuple(target["pos"]),
-                         target_until=now + 1.0)
-
-
 def update_memory(o, px, py, pz):
     visible = set()
     for p in o.get("pickups", []):
@@ -514,8 +510,6 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
         fire_weapons(me, act, tgt, allow_fire=d < 115.0,
                      allow_charge=d <= standoff + 4.0 and
                      not any(m.get("charging") for m in nearby_players))
-        if kind == "npc":
-            remember_engagement(now, act, tgt)
         # Don't run into targets; advance until within accurate gun range.
         act["move"] = [dx / d, dy / d] if d > standoff or not clear else [0, 0]
         return True
@@ -1199,123 +1193,90 @@ def safe_zone_route(o, me, enemies, cx, cy, radius):
     return best_dir
 
 
-def beam_intersection(start, end, me):
-    """Find a point on a beam segment inside the mech's padded collision cylinder."""
-    px, py, pz = me["pos"]
-    radius = me["stats"].get("radius", 2.5) + 1.0
-    bottom, top = pz - 0.5, pz + me["stats"].get("height", 9.0) + 0.5
-    dx, dy, dz = (end[i] - start[i] for i in range(3))
-    first, last = 0.0, 1.0
-    if abs(dz) > 1e-6:
-        low, high = sorted(((bottom - start[2]) / dz, (top - start[2]) / dz))
-        first, last = max(first, low), min(last, high)
-    elif not bottom <= start[2] <= top:
-        return None
-    if first > last:
-        return None
-    horizontal = dx * dx + dy * dy
-    nearest = ((px - start[0]) * dx + (py - start[1]) * dy) / (horizontal or 1.0)
-    fraction = max(first, min(last, nearest))
-    x, y = start[0] + fraction * dx, start[1] + fraction * dy
-    if math.hypot(x - px, y - py) <= radius:
-        return x, y, start[2] + fraction * dz
-    return None
-
-
-def aimed_charge(robot, me):
-    if not robot.get("charging"):
-        return False
-    yaw, pitch = robot["aim"]
-    x, y, z = robot["pos"]
-    start = x, y, z + 7.0 * (1.0 + 0.05 * robot.get("cubes", 0))
-    reach = CFG.get("weapons", {}).get("laser", {}).get("range", 280.0)
-    horizontal = reach * math.cos(pitch)
-    end = x + horizontal * math.cos(yaw), y + horizontal * math.sin(yaw), start[2] + reach * math.sin(pitch)
-    contact = beam_intersection(start, end, me)
-    return contact is not None and (not MAP["ok"] or not los_blocked(start, contact))
-
-
-def crossfire_threats(o, me):
-    """Detect overlapping attacks from identified robots, plus our current engagement."""
+def remember_weapon_sounds(o, me, enemies):
+    """Keep recent nearby weapon bearings that vision does not already explain."""
     now = o["t"]
-    px, py, pz = me["pos"]
-    events = o.get("events", ())
-    killed = {e["target"] for e in events if e["type"] == "kill"}
-    robots = {m["id"]: m for m in o["mechs"]
-              if m["id"] != me["id"] and m["id"] not in killed}
-    for robot_id, (until, _) in list(recent_attackers.items()):
-        if until <= now or robot_id in killed:
-            del recent_attackers[robot_id]
+    reports = [s for s in o.get("sounds", ())
+               if s["dist"] == "near" and s["kind"] in SOUND_STRENGTH and s["age"] <= 0.25]
+    if not reports and not weapon_sounds:
+        return
+    px, py = me["pos"][:2]
+    settings = CFG.get("sound", {})
+    near_range = settings.get("near", 60)
+    tolerance = math.radians(2 * settings.get("bearing_noise_deg", 7) + 4)
+    known_bearings = [math.atan2(m["pos"][1] - py, m["pos"][0] - px) for m in enemies
+                      if math.dist((px, py), m["pos"][:2]) <= near_range + 8]
 
-    for e in events:
-        robot_id = e.get("by")
-        if (e["type"] != "damaged" or robot_id is None
-                or robot_id == me["id"] or robot_id in killed):
+    def matches_observed(bearing):
+        return any(abs(wrap(bearing - known)) <= tolerance for known in known_bearings)
+
+    if weapon_sounds:
+        pending = [cue for cue in weapon_sounds
+                   if now - cue[0] <= SOUND_MEMORY and not matches_observed(cue[1])]
+        weapon_sounds.clear()
+        weapon_sounds.extend(pending)
+    for sound in reports:
+        bearing = sound["bearing"]
+        heard = now - sound["age"]
+        if matches_observed(bearing):
             continue
-        if robot_id in robots:
-            point = tuple(robots[robot_id]["pos"])
-        elif e.get("bearing") is not None:
-            angle = e["bearing"]
-            x, y = px + 70 * math.cos(angle), py + 70 * math.sin(angle)
-            point = x, y, ground_z(x, y, pz)
-        else:
-            point = recent_attackers.get(robot_id, (now, None))[1]
-        recent_attackers[robot_id] = now + 1.5, point
-
-    for beam in o.get("beams", ()):
-        robot_id, age, path = beam.get("by"), beam.get("age", 0), beam["path"]
-        if robot_id is None or robot_id == me["id"] or robot_id in killed or age > 0.35:
+        if any(abs(heard - t) < 0.025 and abs(wrap(bearing - angle)) < 0.2 and kind == sound["kind"]
+               for t, angle, kind in weapon_sounds):
             continue
-        if any(beam_intersection(a, b, me) is not None for a, b in zip(path, path[1:])):
-            point = tuple(robots[robot_id]["pos"]) if robot_id in robots else tuple(path[0])
-            until = max(now + 1.5 - age, recent_attackers.get(robot_id, (now, None))[0])
-            recent_attackers[robot_id] = until, point
-
-    active = {i: tuple(robots[i]["pos"]) if i in robots else point
-              for i, (_, point) in recent_attackers.items()}
-    for robot_id, robot in robots.items():
-        if aimed_charge(robot, me):
-            active[robot_id] = tuple(robot["pos"])
-
-    target = crossfire["target"]
-    if active and target is not None and target not in killed and now < crossfire["target_until"]:
-        active.setdefault(target, tuple(robots[target]["pos"]) if target in robots else crossfire["target_pos"])
-    if len(active) >= 2:
-        crossfire["retreat_until"] = now + 0.45
-    return [point for point in active.values() if point is not None]
+        weapon_sounds.append((heard, bearing, sound["kind"]))
 
 
-def crossfire_heading(o, me, points, fallback):
-    """Find a clear short step away from attackers while staying within zone limits."""
-    if not points:
-        return fallback
-    start = tuple(me["pos"][:2])
-    z = o["zone"]
-    current, future = z["center"], z["next_center"]
-    future_limit = max(math.dist(start, future), 0.94 * z["next_radius"]) + 1.0
-    positions = [point[:2] for point in points]
-    vx, vy = me["vel"][:2]
-    best = None
-    for i in range(12):
-        angle = i * math.tau / 12
+def sound_zone_heading(o, me, desired):
+    """Bias a clear zone route around a sector with recent weapons fire."""
+    speed = math.hypot(*desired)
+    if speed < 0.1 or not MAP["ok"] or not me["grounded"] or route["waypoints"]:
+        return desired
+    now = o["t"]
+    base = math.atan2(desired[1], desired[0])
+    recent = [(t, angle, kind) for t, angle, kind in weapon_sounds
+              if 0 <= now - t <= SOUND_MEMORY]
+    cues = []
+    for heard, bearing, kind in recent:
+        if abs(wrap(bearing - base)) > 0.7:
+            continue
+        if kind == "gun" and not any(
+                abs(t - heard) >= 0.12 and abs(wrap(angle - bearing)) < 0.28
+                for t, angle, _ in recent):
+            continue
+        cues.append((bearing, SOUND_STRENGTH[kind] * (1.0 - (now - heard) / SOUND_MEMORY)))
+    if not cues:
+        return desired
+
+    zone = o["zone"]
+    current_center = zone["center"]
+    target_center = zone["next_center"]
+    px, py = start = tuple(me["pos"][:2])
+    distance = math.dist(start, target_center)
+    look = min(16.0, distance)
+    if look < 4.0:
+        return desired
+    dx, dy = desired[0] / speed, desired[1] / speed
+    if not walkable_segment(start, (px + look * dx, py + look * dy)):
+        return desired
+
+    def danger(angle):
+        # This is a directional penalty. The game only gives a range band.
+        return max(strength * max(0.0, 1.0 - abs(wrap(angle - bearing)) / 0.85) ** 2
+                   for bearing, strength in cues)
+
+    best_score = 2.8 - danger(base)
+    best = desired
+    for offset in (-0.20, 0.20, -0.42, 0.42):
+        angle = base + offset
         ux, uy = math.cos(angle), math.sin(angle)
-        end = start[0] + 11 * ux, start[1] + 11 * uy
-        if math.dist(end, current) > z["radius"] or math.dist(end, future) > future_limit:
+        end = px + look * ux, py + look * uy
+        if (math.dist(end, current_center) > zone["radius"] or
+                distance - math.dist(end, target_center) < 0.7 * look):
             continue
-        if MAP["ok"] and not walkable_segment(start, end):
-            continue
-        nearest = min(math.dist(end, p) for p in positions)
-        approach = min(segment_separation(start, end, p) for p in positions)
-        score = nearest + 0.45 * approach + 0.12 * (vx * ux + vy * uy)
-        score -= 0.18 * max(0.0, math.dist(end, future) - 0.72 * z["next_radius"])
-        if best is None or score > best[0]:
-            best = score, ux, uy
-    if best is not None:
-        return list(best[1:])
-    nearest = min(positions, key=lambda p: math.dist(start, p))
-    dx, dy = start[0] - nearest[0], start[1] - nearest[1]
-    distance = math.hypot(dx, dy)
-    return steer_around(o, me, [dx / distance, dy / distance] if distance else fallback)
+        score = 2.8 * math.cos(offset) - danger(angle)
+        if score > best_score + 0.025 and walkable_segment(start, end):
+            best_score, best = score, [ux * speed, uy * speed]
+    return best
 
 
 def decide(o):
@@ -1347,6 +1308,7 @@ def decide(o):
         act["move"] = [0, 0]
 
     enemies = [m for m in o["mechs"] if m["kind"] == "mech" and m["id"] != me["id"]]
+    remember_weapon_sounds(o, me, enemies)
     dv = laser_dodge(o, me, enemies)
     bullet_move, jump_dodge = projectile_dodge(o, me) if dv is None else (None, False)
     evade = dv if dv is not None else bullet_move
@@ -1355,29 +1317,6 @@ def decide(o):
     urgent = (not me["in_zone"] or
               (distance_to_zone > 0 and now >= z["shrink_start"]
                and distance_to_zone / walk_speed + 2.0 > z["shrink_end"] - now))
-
-    attackers = crossfire_threats(o, me)
-    if now < crossfire["retreat_until"]:
-        if evade is not None:
-            desired = evade
-            act["move"] = steer_around(o, me, desired)
-        elif urgent or not inside:
-            pursuers = [{"pos": p} for p in attackers]
-            desired = safe_zone_route(o, me, pursuers, cx, cy, z["next_radius"])
-            act["move"] = move_with_route(o, me, desired, goal, route_key, pursuers)
-        else:
-            desired = act["move"] = crossfire_heading(o, me, attackers, act["move"])
-        mobility(o, me, act, desired, want_up=False, fleeing=True,
-                 evading=evade is not None, jump_dodge=jump_dodge, urgent=urgent)
-        act["fire"] = [False, False]
-        if attackers:
-            point = min(attackers, key=lambda p: math.hypot(p[0] - px, p[1] - py))
-            act["aim"] = list(aim_toward(me, point, 4.5))
-        if any(w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in me["weapons"]):
-            # Releasing a primed laser can emit a beam during the turn.
-            act["aim"] = [act.get("aim", me["aim"])[0], me["stats"].get("min_pitch", -0.7)]
-        reload_gun(me, act)
-        return act
 
     if enemies:
         t = min(enemies, key=lambda m: math.hypot(m["pos"][0] - px, m["pos"][1] - py))
@@ -1497,13 +1436,15 @@ def decide(o):
         act["move"] = evade
         goal = None
     desired = act["move"]
+    zone_slack = z["shrink_end"] - now - distance_to_zone / walk_speed
+    if route_key == "zone" and not inside and not urgent and not hit_now and evade is None and zone_slack > 6.0:
+        desired = sound_zone_heading(o, me, desired)
     act["move"] = move_with_route(o, me, desired, goal, route_key, enemies)
     mobility(o, me, act, desired, want_up, fleeing, evade is not None,
              jump_dodge, urgent and route_key == "zone")
     if enemies:
         fire_weapons(me, act, t, allow_fire=not (avoid and dist >= 40),
                      allow_charge=evade is None and not (fleeing or urgent or hit_now))
-        remember_engagement(now, act, t)
     reload_gun(me, act)
 
     return act
@@ -1518,7 +1459,7 @@ def main():
     CFG = hello.get("config", {})
     RNG = random.Random(hello.get("seed", 0))
     load_map(hello)
-    send({"type": "ready", "name": "mech-royale-v8j"})
+    send({"type": "ready", "name": "mech-royale-v8k"})
 
     while True:
         m = q.get()
