@@ -112,17 +112,40 @@ def pick_upgrade(offer, held, me):
 
 
 def aim_at(me, tpos, tvel, speed, zoff, lead=True):
-    """yaw, pitch to hit a target; leads moving targets unless lead=False."""
+    """Analytic 3-D projectile interception, including relative target velocity.
+
+    For hitscan lasers, pass lead=False. If interception is impossible, aim at
+    the current position rather than leading wildly.
+    """
     px, py, pz = me["pos"]
-    mz = pz + me["stats"].get("muzzle_height", 7)
-    dist = math.hypot(tpos[0] - px, tpos[1] - py)
-    ft = dist / speed if lead else 0.0
-    tx = tpos[0] + tvel[0] * ft
-    ty = tpos[1] + tvel[1] * ft
-    tz = tpos[2] + zoff
-    yaw = math.atan2(ty - py, tx - px)
-    pitch = math.atan2(tz - mz, math.hypot(tx - px, ty - py))
-    return yaw, pitch
+    muzzle = pz + me["stats"].get("muzzle_height", 7)
+    rx, ry, rz = tpos[0]-px, tpos[1]-py, tpos[2]+zoff-muzzle
+    vx, vy, vz = (tvel + [0, 0, 0])[:3] if isinstance(tvel, list) else (list(tvel)+[0,0,0])[:3]
+    flight = 0.0
+    if lead and speed > 1:
+        aa = vx*vx + vy*vy + vz*vz - speed*speed
+        bb = 2*(rx*vx + ry*vy + rz*vz)
+        cc = rx*rx + ry*ry + rz*rz
+        roots = []
+        if abs(aa) < 1e-8:
+            if abs(bb) > 1e-8:
+                roots = [-cc/bb]
+        else:
+            disc = bb*bb - 4*aa*cc
+            if disc >= 0:
+                roots = [(-bb-math.sqrt(disc))/(2*aa), (-bb+math.sqrt(disc))/(2*aa)]
+        valid = [v for v in roots if v > 0]
+        if valid:
+            flight = min(min(valid), 1.5)
+    rx += vx*flight
+    ry += vy*flight
+    rz += vz*flight
+    return math.atan2(ry, rx), math.atan2(rz, math.hypot(rx, ry))
+
+
+def aim_tolerance(distance, target_radius=2.5):
+    """Only fire when the muzzle is pointing near the projected hitbox."""
+    return max(0.012, min(0.10, math.atan2(target_radius, max(distance, 1))))
 
 
 def fire_second(me, w1, dist, yaw_direct_err):
@@ -232,7 +255,11 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
 
     if cands:
         cands.sort(key=lambda c: c[0])
-        _, key, tgt, kind, standoff = cands[0]
+        selected = cands[0]
+        locked = next((c for c in cands if c[1] == chase["key"]), None)
+        if locked and locked[0] < selected[0] + 32 and now-chase["start"] < 18:
+            selected = locked
+        _, key, tgt, kind, standoff = selected
         tpos = tgt["pos"]
         chase["tz"] = tpos[2]
         dx, dy = tpos[0] - px, tpos[1] - py
@@ -246,9 +273,11 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
         elif d > standoff + 5 and now - chase["t"] > 3.0:
             ignore[key] = now + 30
             chase["key"] = None
+            return False
         if kind in ("npc", "crate") and now - chase["start"] > 18.0:
             ignore[key] = now + 40
             chase["key"] = None
+            return False
 
         if kind == "pickup":
             if d < 3.0:
@@ -650,7 +679,10 @@ def decide(o):
     firing_gun = False
 
     if enemies:
-        t = min(enemies, key=lambda m: math.hypot(m["pos"][0] - px, m["pos"][1] - py))
+        # Prefer nearby, wounded targets, but do not chase distant targets.
+        t = min(enemies, key=lambda m:
+                math.hypot(m["pos"][0]-px, m["pos"][1]-py)
+                + (0.0008 * m.get("hp", 1400) if m.get("hp") is not None else 1.1))
         dx, dy = t["pos"][0] - px, t["pos"][1] - py
         dist = math.hypot(dx, dy) or 1.0
         speed = gun["stats"]["speed"] if gun else 252
@@ -676,9 +708,11 @@ def decide(o):
         yaw_direct = math.atan2(dy, dx)
         yaw_err = abs(wrap(yaw_direct - me["aim"][0]))
 
-        # laser is hitscan: aim straight at the target instead of leading
-        lead = not (kind1 == "laser" and w1["cooldown"] < 0.3)
-        yaw, pitch = aim_at(me, t["pos"], t["vel"], speed, 4.5, lead)
+        # Aim the primary gun using interception. When a laser is ready,
+        # prioritize hitscan aiming instead of incorrectly leading its beam.
+        laser_ready = (kind1 == "laser" and w1.get("cooldown", 1) <= 0.05)
+        yaw, pitch = aim_at(me, t["pos"], t.get("vel", [0, 0, 0]),
+                            speed, 4.5, not laser_ready)
         lob = False
         if kind1 == "mortar" and w1["cooldown"] <= 0.05 and 15 < dist < 200:
             v = w1["stats"].get("speed", 72)
@@ -693,13 +727,24 @@ def decide(o):
                 lob = True
         act["aim"] = [yaw, pitch]
 
-        fire1 = fire_second(me, w1, dist, yaw_err)
+        aim_error = abs(wrap(yaw - me["aim"][0]))
+        pitch_error = abs(pitch - me["aim"][1])
+        tolerance = aim_tolerance(dist, 2.5 + 0.12 * t.get("cubes", 0))
+        aligned = aim_error < tolerance and pitch_error < tolerance
+        # A laser fires when the trigger is released after charging.
+        # Use the correct aim (hitscan, no leading) and require tight alignment.
+        fire1 = fire_second(me, w1, dist, aim_error)
+        if kind1 == "laser" and w1.get("charge", 0) <= 0 and not aligned:
+            fire1 = False
         if lob:
             fire1 = (abs(wrap(yaw - me["aim"][0])) < 0.08 and abs(pitch - me["aim"][1]) < 0.05)
             firing_gun = False
             fire0 = False
         else:
-            fire0 = abs(wrap(yaw - me["aim"][0])) < 0.1
+            fire0 = bool(gun and gun.get("ammo", 0) > 0 and
+                         gun.get("reload", 0) <= 0 and aligned and
+                         dist < gun["stats"].get("range", 230) - 3 and
+                         not laser_ready)
             firing_gun = fire0
         if avoid and dist >= 40:       # don't provoke or reset regen unless they are on top of us
             fire0 = fire1 = False
@@ -831,7 +876,7 @@ def main():
     if LOG:
         LOG.write(json.dumps({"hello": hello, "map_ok": MAP["ok"]}) + "\n")
         LOG.flush()
-    send({"type": "ready", "name": "simple-bot"})
+    send({"type": "ready", "name": "v5-precision-survival"})
 
     while True:
         m = q.get()
