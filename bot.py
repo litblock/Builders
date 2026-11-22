@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import queue
 import random
 import sys
@@ -8,6 +9,10 @@ import time
 from array import array
 
 q = queue.Queue()
+
+# Offline debugging only: set MECH_LOG=log.jsonl when running check.py.
+# Unset in real matches, so nothing is opened on the read-only disk.
+LOG = open(os.environ["MECH_LOG"], "a") if os.environ.get("MECH_LOG") else None
 
 CFG = {}
 RNG = random.Random(0)
@@ -178,122 +183,136 @@ def update_memory(o, px, py, pz):
 
 
 def loot(o, me, act, held, z, cx, cy, enemies_none=True):
-    """V7A: conservative loot scoring with target commitment, based on V4 combat."""
+    """Prioritize reachable pickups/cubes, actively break crates for loot, then farm NPCs."""
     px, py, pz = me["pos"]
     now = o["t"]
     chase["tz"] = None
     need_weapon = me["weapons"][1] is None
-    # Only seek loot inside a future-safe area, or close enough to return before
-    # the first shrink. The latter lets edge spawns loot instead of marching
-    # across the arena empty-handed for the first minute.
-    nr = z["next_radius"]
-    shrink_start = z.get("shrink_start", 0)
-    dist_to_next = math.hypot(px - cx, py - cy)
-    travel_buffer = max(0.0, (dist_to_next - 0.78 * nr) / 11.7)
-    can_detour = me.get("in_zone", False) and now + travel_buffer + 15 < shrink_start
+    safe_r = 0.92 * z["next_radius"]
 
-    def valid(pos, key, kind):
+    def ok(pos, key, slope=False):
         if ignore.get(key, 0) > now:
             return False
-        d = math.hypot(pos[0] - px, pos[1] - py)
         dz = abs(pos[2] - pz)
-        if dz > (2.5 + 0.22 * d if kind == "cube" else 3.0):
+        if slope:                     # allow gentle terrain over distance
+            dz -= 0.25 * math.hypot(pos[0] - px, pos[1] - py)
+        if dz > 2.5:                  # roofs etc.: we cannot walk up there
             return False
-        next_dist = math.hypot(pos[0] - cx, pos[1] - cy)
-        if next_dist > 0.90 * nr:
-            if not can_detour or d > 65 or now + d / 10 + max(0, (next_dist - 0.78 * nr) / 11.7) + 12 >= shrink_start:
-                return False
-        # Reject immediately blocked targets except close targets, for which
-        # V4's obstacle steering can find a short approach.
-        if d > 22 and not path_clear(px, py, pos[0], pos[1], max_len=min(d, 130)):
-            return False
-        return True
+        return math.hypot(pos[0] - cx, pos[1] - cy) < safe_r
 
-    enemies = [m for m in o.get("mechs", []) if m.get("kind") == "mech" and m.get("id") != me["id"]]
-    def danger(pos):
-        if not enemies:
-            return 0.0
-        nearest = min(math.hypot(pos[0]-m["pos"][0], pos[1]-m["pos"][1]) for m in enemies)
-        if nearest < 35: return 500.0
-        if nearest < 60: return 160.0
-        if nearest < 95: return 55.0
-        return 0.0
+    # Small, localized loot risk penalty; unlike V2, do not reject loot outright.
+    nearby_players = [m for m in o.get("mechs", []) if m["kind"] == "mech"]
+    def risk(pos):
+        nearest = min((math.hypot(pos[0]-m["pos"][0], pos[1]-m["pos"][1])
+                       for m in nearby_players), default=999.0)
+        return 110.0 if nearest < 25 else (35.0 if nearest < 45 else 0.0)
 
-    cands = []  # score, key, target, kind, stopping distance
+    cands = []   # (score, key, pos, kind, standoff)
     if need_weapon:
         for pid, p in known.items():
-            if p["kind"] in held or not valid(p["pos"], ("p", pid), "pickup"):
+            if p["kind"] in held or not ok(p["pos"], ("p", pid)):
                 continue
-            d = math.hypot(p["pos"][0]-px, p["pos"][1]-py)
-            if d < 130:
-                cands.append((d + 18 * WEAPON_RANK.get(p["kind"], 3) - 45 + danger(p["pos"]), ("p", pid), p, "pickup", 2.5))
+            d = math.hypot(p["pos"][0] - px, p["pos"][1] - py)
+            if d < 165:
+                cands.append((10 + d + 18 * WEAPON_RANK.get(p["kind"], 3) + risk(p["pos"]), ("p", pid), p, "pickup", 1.0))
+    # V8A single experiment: modestly prefer already-dropped cubes over
+    # shooting crates. Preserve all V4 combat, navigation, and survival logic.
     for rec in known_cubes.values():
         c = rec["c"]
-        d = math.hypot(c["pos"][0]-px, c["pos"][1]-py)
-        if d < 105 and valid(c["pos"], ("c", c["id"]), "cube"):
-            cands.append((d - 22 + danger(c["pos"]), ("c", c["id"]), c, "cube", 1.5))
-    for c in o.get("crates", []):
-        d = math.hypot(c["pos"][0]-px, c["pos"][1]-py)
-        if d < 100 and valid(c["pos"], ("k", c["id"]), "crate"):
-            cands.append((d + (35 if need_weapon else 65) + danger(c["pos"]), ("k", c["id"]), c, "crate", 18.0))
+        d = math.hypot(c["pos"][0] - px, c["pos"][1] - py)
+        if d < 125 and ok(c["pos"], ("c", c["id"]), slope=True):
+            # V8C: a cube is only worth chasing when the pickup is not contested.
+            # Visible mechs are the only reliable threats in this observation;
+            # do not mistake NPCs for opposing players.
+            enemy_to_cube = min((math.hypot(c["pos"][0] - m["pos"][0],
+                                             c["pos"][1] - m["pos"][1])
+                                 for m in nearby_players), default=999.0)
+            enemy_to_self = min((math.hypot(px - m["pos"][0],
+                                             py - m["pos"][1])
+                                 for m in nearby_players), default=999.0)
+            # Keep looting from overriding combat or retreat when a threat is close.
+            if enemy_to_self < 45 or enemy_to_cube < 30:
+                continue
+            # Deprioritize moderately contested cubes; don't chase them first.
+            cube_danger = 55.0 if enemy_to_cube < 65 else 0.0
+            cands.append((20 + d + risk(c["pos"]) + cube_danger,
+                          ("c", c["id"]), c, "cube", 0.5))
     for m in o.get("mechs", []):
-        if m.get("kind") == "npc":
-            d = math.hypot(m["pos"][0]-px, m["pos"][1]-py)
-            if d < 75 and valid(m["pos"], ("n", m["id"]), "npc"):
-                cands.append((d + 105 + danger(m["pos"]), ("n", m["id"]), m, "npc", 28.0))
+        if m["kind"] == "npc":
+            d = math.hypot(m["pos"][0] - px, m["pos"][1] - py)
+            if d < 90 and ok(m["pos"], ("n", m["id"])):
+                cands.append((135 + d + risk(m["pos"]), ("n", m["id"]), m, "npc", 28.0))
+    # V8B experiment: avoid committing to a crate when enemies can contest it.
+    # Only visible enemy mechs count; retain V8A's behavior when none are visible.
+    for c in o.get("crates", []):
+        d = math.hypot(c["pos"][0] - px, c["pos"][1] - py)
+        if d < 120 and ok(c["pos"], ("k", c["id"])):
+            enemy_to_crate = min((math.hypot(c["pos"][0] - m["pos"][0],
+                                              c["pos"][1] - m["pos"][1])
+                                  for m in nearby_players), default=999.0)
+            enemy_to_self = min((math.hypot(px - m["pos"][0], py - m["pos"][1])
+                                 for m in nearby_players), default=999.0)
+            # A crate takes several gunshots to open. Avoid exposing ourselves
+            # at short range, but do not disable looting due to distant enemies.
+            if enemy_to_self < 55 or enemy_to_crate < 40:
+                continue
+            crate_danger = 65.0 if enemy_to_crate < 75 else 0.0
+            cands.append((100 + d + risk(c["pos"]) + crate_danger,
+                          ("k", c["id"]), c, "crate", 22.0))
 
     if cands:
-        cands.sort(key=lambda v: v[0])
-        # Keep pursuing a reasonable target: otherwise scores change slightly
-        # each frame and the mech oscillates between several nearby objects.
-        chosen = cands[0]
-        for candidate in cands:
-            if candidate[1] == chase["key"] and candidate[0] <= chosen[0] + 40:
-                chosen = candidate
-                break
-        _, key, tgt, kind, standoff = chosen
+        cands.sort(key=lambda c: c[0])
+        _, key, tgt, kind, standoff = cands[0]
         tpos = tgt["pos"]
+        chase["tz"] = tpos[2]
         dx, dy = tpos[0] - px, tpos[1] - py
-        d = math.hypot(dx, dy)
+        d = math.hypot(dx, dy) or 1.0
+
+        # stuck / timeout detection (no pathfinding yet)
         if chase["key"] != key:
             chase.update(key=key, best=d, t=now, start=now)
-        elif d < chase["best"] - 1.0:
+        elif d < chase["best"] - 1.5:
             chase.update(best=d, t=now)
-        elif d > standoff + 5 and now - chase["t"] > 3.5:
-            ignore[key] = now + 22
-            chase["key"] = None
-            return False
-        if kind in ("crate", "npc") and now - chase["start"] > 16:
+        elif d > standoff + 5 and now - chase["t"] > 3.0:
             ignore[key] = now + 30
             chase["key"] = None
-            return False
-        chase["tz"] = tpos[2]
+        if kind in ("npc", "crate") and now - chase["start"] > 18.0:
+            ignore[key] = now + 40
+            chase["key"] = None
+
         if kind == "pickup":
-            if d < 3.5:
+            if d < 3.0:
                 act["take"] = tgt["id"]
-            act["move"] = [dx / d, dy / d] if d > 2.2 else [0, 0]
+            act["move"] = [dx / d, dy / d] if d > 2.0 else [0, 0]
             return True
         if kind == "cube":
-            act["move"] = [dx / d, dy / d] if d > 1.5 else [0, 0]
+            act["move"] = [dx / d, dy / d]
             return True
+        # Crates MUST be shot to break them: 300 HP -> 1 cube and 50% weapon drop.
+        # Shoot while approaching; keep a safe standoff so the mech does not
+        # walk into the crate. NPCs also drop cubes when killed.
         gun = me["weapons"][0]
         speed = gun["stats"].get("speed", 252) if gun else 252
-        yaw, pitch = aim_at(me, tpos, tgt.get("vel", [0, 0, 0]), speed, 1.6 if kind == "npc" else 1.2)
+        zoff = 1.6 if kind == "npc" else 1.2
+        tv = tgt.get("vel", [0, 0, 0])
+        yaw, pitch = aim_at(me, tpos, tv, speed, zoff)
         act["aim"] = [yaw, pitch]
         yaw_ok = abs(wrap(yaw - me["aim"][0])) < 0.075
         pitch_ok = abs(pitch - me["aim"][1]) < 0.085
         clear = path_clear(px, py, tpos[0], tpos[1], max_len=120)
-        act["fire"] = [bool(gun and gun.get("reload", 0) <= 0 and gun.get("ammo", 0) > 0
-                            and yaw_ok and pitch_ok and d < 110 and clear), False]
-        act["move"] = [dx / d, dy / d] if d > standoff and d > 0.01 else [0, 0]
+        act["fire"] = [bool(gun and gun.get("reload", 0) <= 0 and
+                            gun.get("ammo", 0) > 0 and yaw_ok and pitch_ok and
+                            d < 115 and clear), False]
+        # Don't run into targets; advance until within accurate gun range.
+        act["move"] = [dx / d, dy / d] if d > standoff else [0, 0]
         return True
 
-    # Keep V4's exploration behavior when no reachable loot is visible.
+    # nothing to go for: look for a second weapon by wandering inside the zone
     if need_weapon and now < 150:
         wp = wander["pt"]
         if wp is None or now > wander["until"] or math.hypot(wp[0] - px, wp[1] - py) < 10:
             a = RNG.uniform(0, 2 * math.pi)
-            r = 0.75 * nr * math.sqrt(RNG.random())
+            r = 0.75 * z["next_radius"] * math.sqrt(RNG.random())
             wander["pt"] = (cx + r * math.cos(a), cy + r * math.sin(a))
             wander["until"] = now + 10
             wp = wander["pt"]
@@ -361,8 +380,10 @@ def load_map(hello):
                     grid.setdefault((gx, gy), []).append(idx)
         MAP.update(ok=True, arr=arr, nx=nx, ny=ny, minX=float(t["minX"]), minY=float(t["minY"]),
                    step=float(t.get("step", 1.0)), prisms=prisms, grid=grid)
+        print("map loaded: %d prisms, terrain %dx%d" % (len(prisms), nx, ny), file=sys.stderr)
     except Exception as e:
         MAP["ok"] = False
+        print("map NOT loaded (retreat uses plain flee):", repr(e), file=sys.stderr)
 
 
 def in_terrain(x, y):
@@ -627,6 +648,55 @@ def mobility(o, me, act, want_up, fleeing, hit_now):
         act["boost"] = True                          # in the air: jet until the feet clear the edge
 
 
+
+def safe_zone_route(o, me, enemies, cx, cy, radius):
+    """Pick a short local zone-bound heading that avoids visible mechs.
+
+    Never let a large detour jeopardize reaching the shrinking circle.
+    """
+    px, py, _ = me["pos"]
+    gx, gy = cx - px, cy - py
+    gd = math.hypot(gx, gy)
+    if gd < 2:
+        return [0.0, 0.0]
+    ux, uy = gx / gd, gy / gd
+    if not enemies:
+        return [ux, uy]
+    # Threats outside ~115m do not justify a detour.
+    nearby = [m for m in enemies if math.hypot(m["pos"][0]-px, m["pos"][1]-py) < 115]
+    if not nearby:
+        return [ux, uy]
+    z = o["zone"]
+    # If already taking zone damage, prioritize the fastest route to safety.
+    urgent = not me.get("in_zone", True) or o["t"] >= z.get("shrink_start", 1e9)
+    max_turn = 0.42 if urgent else 0.85
+    look = min(32.0, max(12.0, gd * 0.3))
+    best, best_dir = -1e20, [ux, uy]
+    for turn in (-max_turn, -max_turn/2, 0, max_turn/2, max_turn):
+        ca, sa = math.cos(turn), math.sin(turn)
+        vx, vy = ux*ca-uy*sa, ux*sa+uy*ca
+        tx, ty = px + look*vx, py + look*vy
+        if MAP["ok"] and (not in_terrain(tx, ty) or solid_at(tx, ty)):
+            continue
+        # Penalize passing close to an enemy, including midway along the route.
+        danger = 0.0
+        for e in nearby:
+            ex, ey = e["pos"][:2]
+            rx, ry = ex-px, ey-py
+            along = max(0.0, min(look, rx*vx + ry*vy))
+            sep = math.hypot(rx-along*vx, ry-along*vy)
+            if sep < 75:
+                danger += ((75-sep)/75)**2 * (2.4 if sep < 35 else 1.4)
+            # Discourage heading directly toward a mech even beyond lookahead.
+            if along > 0 and math.hypot(rx,ry) < 60:
+                danger += max(0, (60-math.hypot(rx,ry))/60) * 0.6
+        progress = (gx*vx + gy*vy) / gd
+        score = (5.0 if urgent else 2.8)*progress - danger
+        if score > best:
+            best, best_dir = score, [vx, vy]
+    return best_dir
+
+
 def decide(o):
     me = o["self"]
     px, py, pz = me["pos"]
@@ -667,7 +737,7 @@ def decide(o):
 
         # Baseline V1 survival thresholds retained; do not repeat V2's broad retreat policy.
         # Distant enemies should not prevent safe farming and collecting upgrades.
-        if dist > 75 and not hit_now and now < 180 and (inside or (me["in_zone"] and now < z.get("shrink_start", 0) - 20)):
+        if inside and dist > 75 and not hit_now and now < 180:
             if loot(o, me, act, held, z, cx, cy):
                 act["move"] = steer_around(o, me, act.get("move", [0, 0]))
                 mobility(o, me, act, chase["tz"] is not None and chase["tz"] - pz > 1.0,
@@ -804,7 +874,7 @@ def decide(o):
             act["move"] = [ddx / dd, ddy / dd] if dd > 3.0 else [0, 0]
             acted = True
         else:
-            acted = loot(o, me, act, held, z, cx, cy) if (inside or (me["in_zone"] and now < z.get("shrink_start", 0) - 20)) else False
+            acted = loot(o, me, act, held, z, cx, cy) if inside else False
             want_up = acted and chase["tz"] is not None and chase["tz"] - pz > 1.0
         if "fire" in act:
             firing_gun = act["fire"][0]
@@ -815,6 +885,10 @@ def decide(o):
             if hits:
                 act["aim"] = [hits[-1]["bearing"], 0]
 
+    # V8D: when travelling to the next circle, avoid visible enemy mechs.
+    # Preserve combat/laser dodge and any deliberate looting while safely inside.
+    if not inside and enemies and not fleeing:
+        act["move"] = safe_zone_route(o, me, enemies, cx, cy, z["next_radius"])
     # Apply obstacle avoidance to zone travel, loot chasing, combat and retreat.
     # Do not override intentional stationary actions (healing or shooting from cover).
     act["move"] = steer_around(o, me, act.get("move", [0, 0]))
@@ -837,6 +911,9 @@ def main():
     CFG = hello.get("config", {})
     RNG = random.Random(hello.get("seed", 0))
     load_map(hello)
+    if LOG:
+        LOG.write(json.dumps({"hello": hello, "map_ok": MAP["ok"]}) + "\n")
+        LOG.flush()
     send({"type": "ready", "name": "simple-bot"})
 
     while True:
@@ -856,8 +933,12 @@ def main():
             try:
                 act = decide(m)
             except Exception as e:
+                print("error:", repr(e), file=sys.stderr)
                 act = {"tick": m["tick"]}
             send(act)
+            if LOG:
+                LOG.write(json.dumps({"obs": m, "act": act}) + "\n")
+                LOG.flush()
 
 
 if __name__ == "__main__":
