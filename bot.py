@@ -23,14 +23,14 @@ ignore = {}      # (type, id) -> match time until which we skip that target
 chase = {"key": None, "best": 1e9, "t": 0.0, "start": 0.0, "tz": None}
 wander = {"pt": None, "until": 0.0}
 
-EARLY_S = 165     # "early game": avoid fights against healthier enemies before this match time
+EARLY_S = 120     # "early game": avoid fights against healthier enemies before this match time
 HP_AVOID = 0.8    # avoid an enemy whose HP is more than 1/0.8 = 1.25x ours
-FLEE_KEEP_S = 5.0  # keep running from the last threat this long after losing sight of it
+FLEE_KEEP_S = 3.0  # keep running from the last threat this long after losing sight of it
 HOP_ON_HIT = True  # hop while fleeing when shot (weak: our hitbox is 9 m tall; set False to disable)
 flee_mem = {"until": 0.0, "from": None}
 COVER_RADII = (10.0, 20.0, 35.0, 50.0, 70.0)   # how far from us to look for cover (m)
 COVER_ANGLES = 24                  # directions tried per radius
-HEAL_HOLD_S = 32.0  # after a retreat, wait in cover this long (or until ~90% HP)
+HEAL_HOLD_S = 25.0  # after a retreat, wait in cover this long (or until ~90% HP)
 cover = {"pt": None, "plan_t": -99.0, "hold_until": 0.0, "hidden": False}
 dodge = {"until": 0.0, "side": 1}
 MAP = {"ok": False}
@@ -183,22 +183,15 @@ def update_memory(o, px, py, pz):
 
 
 def loot(o, me, act, held, z, cx, cy, enemies_none=True):
-    """Weapon pickups > cubes > NPC/crate farming > wander. Returns True if it acted."""
+    """Prioritize reachable pickups/cubes, actively break crates for loot, then farm NPCs."""
     px, py, pz = me["pos"]
     now = o["t"]
     chase["tz"] = None
     need_weapon = me["weapons"][1] is None
-    safe_r = 0.82 * z["next_radius"]
-    # Loot should not lure us into a nearby player. Distance is measured from
-    # the pickup/farming destination, not merely from our current position.
-    players = [m for m in o.get("mechs", []) if m["kind"] == "mech" and m["id"] != me["id"]]
-    def risky(pos):
-        return any(math.hypot(pos[0] - m["pos"][0], pos[1] - m["pos"][1]) <
-                   (95 if now < EARLY_S else 65) for m in players)
-
+    safe_r = 0.92 * z["next_radius"]
 
     def ok(pos, key, slope=False):
-        if risky(pos) or ignore.get(key, 0) > now:
+        if ignore.get(key, 0) > now:
             return False
         dz = abs(pos[2] - pz)
         if slope:                     # allow gentle terrain over distance
@@ -207,28 +200,35 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
             return False
         return math.hypot(pos[0] - cx, pos[1] - cy) < safe_r
 
+    # Small, localized loot risk penalty; unlike V2, do not reject loot outright.
+    nearby_players = [m for m in o.get("mechs", []) if m["kind"] == "mech"]
+    def risk(pos):
+        nearest = min((math.hypot(pos[0]-m["pos"][0], pos[1]-m["pos"][1])
+                       for m in nearby_players), default=999.0)
+        return 110.0 if nearest < 25 else (35.0 if nearest < 45 else 0.0)
+
     cands = []   # (score, key, pos, kind, standoff)
     if need_weapon:
         for pid, p in known.items():
             if p["kind"] in held or not ok(p["pos"], ("p", pid)):
                 continue
             d = math.hypot(p["pos"][0] - px, p["pos"][1] - py)
-            if d < 150:
-                cands.append((d + 40 * WEAPON_RANK.get(p["kind"], 3), ("p", pid), p, "pickup", 1.0))
+            if d < 165:
+                cands.append((10 + d + 18 * WEAPON_RANK.get(p["kind"], 3) + risk(p["pos"]), ("p", pid), p, "pickup", 1.0))
     for rec in known_cubes.values():
         c = rec["c"]
         d = math.hypot(c["pos"][0] - px, c["pos"][1] - py)
-        if d < 80 and ok(c["pos"], ("c", c["id"]), slope=True):
-            cands.append((200 + d, ("c", c["id"]), c, "cube", 0.5))
+        if d < 125 and ok(c["pos"], ("c", c["id"]), slope=True):
+            cands.append((40 + d + risk(c["pos"]), ("c", c["id"]), c, "cube", 0.5))
     for m in o.get("mechs", []):
-        if m["kind"] == "npc" and (not players or min(math.hypot(m["pos"][0]-e["pos"][0],m["pos"][1]-e["pos"][1]) for e in players)>120):
+        if m["kind"] == "npc":
             d = math.hypot(m["pos"][0] - px, m["pos"][1] - py)
-            if d < 70 and ok(m["pos"], ("n", m["id"])):
-                cands.append((300 + d, ("n", m["id"]), m, "npc", 30.0))
+            if d < 90 and ok(m["pos"], ("n", m["id"])):
+                cands.append((135 + d + risk(m["pos"]), ("n", m["id"]), m, "npc", 28.0))
     for c in o.get("crates", []):
         d = math.hypot(c["pos"][0] - px, c["pos"][1] - py)
-        if d < 70 and ok(c["pos"], ("k", c["id"])):
-            cands.append((310 + d, ("k", c["id"]), c, "crate", 20.0))
+        if d < 120 and ok(c["pos"], ("k", c["id"])):
+            cands.append((100 + d + risk(c["pos"]), ("k", c["id"]), c, "crate", 22.0))
 
     if cands:
         cands.sort(key=lambda c: c[0])
@@ -246,7 +246,7 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
         elif d > standoff + 5 and now - chase["t"] > 3.0:
             ignore[key] = now + 30
             chase["key"] = None
-        if kind in ("npc", "crate") and now - chase["start"] > 12.0:
+        if kind in ("npc", "crate") and now - chase["start"] > 18.0:
             ignore[key] = now + 40
             chase["key"] = None
 
@@ -258,29 +258,34 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
         if kind == "cube":
             act["move"] = [dx / d, dy / d]
             return True
-        # npc / crate: close to standoff range and shoot the gun
+        # Crates MUST be shot to break them: 300 HP -> 1 cube and 50% weapon drop.
+        # Shoot while approaching; keep a safe standoff so the mech does not
+        # walk into the crate. NPCs also drop cubes when killed.
         gun = me["weapons"][0]
-        speed = gun["stats"]["speed"] if gun else 252
-        zoff = 1.75 if kind == "npc" else 1.5
+        speed = gun["stats"].get("speed", 252) if gun else 252
+        zoff = 1.6 if kind == "npc" else 1.2
         tv = tgt.get("vel", [0, 0, 0])
         yaw, pitch = aim_at(me, tpos, tv, speed, zoff)
         act["aim"] = [yaw, pitch]
-        act["fire"] = [abs(wrap(yaw - me["aim"][0])) < 0.1, False]
+        yaw_ok = abs(wrap(yaw - me["aim"][0])) < 0.075
+        pitch_ok = abs(pitch - me["aim"][1]) < 0.085
+        clear = path_clear(px, py, tpos[0], tpos[1], max_len=120)
+        act["fire"] = [bool(gun and gun.get("reload", 0) <= 0 and
+                            gun.get("ammo", 0) > 0 and yaw_ok and pitch_ok and
+                            d < 115 and clear), False]
+        # Don't run into targets; advance until within accurate gun range.
         act["move"] = [dx / d, dy / d] if d > standoff else [0, 0]
         return True
 
     # nothing to go for: look for a second weapon by wandering inside the zone
-    if now < 220:
+    if need_weapon and now < 150:
         wp = wander["pt"]
         if wp is None or now > wander["until"] or math.hypot(wp[0] - px, wp[1] - py) < 10:
             a = RNG.uniform(0, 2 * math.pi)
-            r = 0.60 * z["next_radius"] * math.sqrt(RNG.random())
+            r = 0.75 * z["next_radius"] * math.sqrt(RNG.random())
             wander["pt"] = (cx + r * math.cos(a), cy + r * math.sin(a))
-            wander["until"] = now + 9
+            wander["until"] = now + 10
             wp = wander["pt"]
-        if risky((wp[0], wp[1], pz)):
-            wander["pt"] = None
-            return False
         dx, dy = wp[0] - px, wp[1] - py
         d = math.hypot(dx, dy) or 1.0
         act["move"] = [dx / d, dy / d]
@@ -651,20 +656,22 @@ def decide(o):
         speed = gun["stats"]["speed"] if gun else 252
         kind1 = w1["kind"] if w1 else None
 
-        # Survival-first: proximity, health, enemy gear and the match phase
-        # matter more than a simplistic HP comparison. A visible distant
-        # player should not prevent us from safely collecting upgrades.
-        hp_frac = me["hp"] / max(1.0, me["max_hp"])
-        def danger(m):
-            d = math.hypot(m["pos"][0]-px, m["pos"][1]-py)
-            armed = len(m.get("weapons", [])) > len([w for w in held if w])
-            stronger = (m.get("hp", me["hp"]) > me["hp"] * 0.85 or armed
-                        or m.get("cubes", 0) > me.get("cubes", 0) + 2)
-            return d < (135 if now < EARLY_S else 85) and (now < EARLY_S or stronger or hp_frac < 0.72)
-        threats = [m for m in enemies if danger(m)]
-        avoid = bool(threats)
-        safe_to_loot = (not threats and
-                        min(math.hypot(m["pos"][0]-px,m["pos"][1]-py) for m in enemies) > 145)
+        # Baseline V1 survival thresholds retained; do not repeat V2's broad retreat policy.
+        # Distant enemies should not prevent safe farming and collecting upgrades.
+        if inside and dist > 75 and not hit_now and now < 180:
+            if loot(o, me, act, held, z, cx, cy):
+                act["move"] = steer_around(o, me, act.get("move", [0, 0]))
+                mobility(o, me, act, chase["tz"] is not None and chase["tz"] - pz > 1.0,
+                         False, hit_now)
+                if gun and gun["reload"] == 0 and gun["ammo"] == 0:
+                    act["reload"] = True
+                return act
+
+        # early game: avoid enemies that are healthier than us (needs enemy hp in obs)
+        threats = [m for m in enemies
+                   if m.get("hp") is not None and me["hp"] < HP_AVOID * m["hp"]
+                   and math.hypot(m["pos"][0] - px, m["pos"][1] - py) < 150]
+        avoid = o["t"] < EARLY_S and bool(threats)
 
         yaw_direct = math.atan2(dy, dx)
         yaw_err = abs(wrap(yaw_direct - me["aim"][0]))
@@ -694,20 +701,12 @@ def decide(o):
         else:
             fire0 = abs(wrap(yaw - me["aim"][0])) < 0.1
             firing_gun = fire0
-        if avoid and dist >= 55:       # don't provoke or reset regen unless they are on top of us
+        if avoid and dist >= 40:       # don't provoke or reset regen unless they are on top of us
             fire0 = fire1 = False
         act["fire"] = [fire0, fire1]
 
-        # If the only visible players are far away, continue progressing
-        # instead of chasing them or wasting time strafing.
-        if inside and safe_to_loot:
-            progressed = loot(o, me, act, held, z, cx, cy)
-            if progressed:
-                act["fire"] = [False, False]
-                firing_gun = False
-                want_up = chase["tz"] is not None and chase["tz"] - pz > 1.0
         # strafe, close in with lightning, or back off when low on HP
-        if inside and not safe_to_loot:
+        if inside:
             if avoid:
                 fleeing = True
                 tt = min(threats, key=lambda m: math.hypot(m["pos"][0] - px, m["pos"][1] - py))
@@ -727,7 +726,7 @@ def decide(o):
                 if rv is not None:
                     cover["hold_until"] = now + HEAL_HOLD_S
                 act["move"] = rv if rv is not None else [fx, fy]
-            elif me["hp"] < 0.72 * me["max_hp"]:
+            elif me["hp"] < 0.35 * me["max_hp"]:
                 fleeing = True
                 flee_mem["until"] = now + FLEE_KEEP_S
                 flee_mem["from"] = (t["pos"][0], t["pos"][1])
@@ -806,11 +805,6 @@ def decide(o):
                     if e.get("type") == "damaged" and e.get("bearing") is not None]
             if hits:
                 act["aim"] = [hits[-1]["bearing"], 0]
-
-    # Preserve energy for escapes: use boost only for real threats, and
-    # favor reaching cover over trading shots when injured.
-    if fleeing and me["energy"] > 45 and me["hp"] < 0.8 * me["max_hp"]:
-        act["boost"] = True
 
     # Apply obstacle avoidance to zone travel, loot chasing, combat and retreat.
     # Do not override intentional stationary actions (healing or shooting from cover).
