@@ -35,6 +35,7 @@ cover = {"pt": None, "plan_t": -99.0, "hold_until": 0.0, "hidden": False}
 dodge = {"until": 0.0, "side": 1}
 MAP = {"ok": False}
 mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0}
+evasion = {"until": 0.0, "side": 1, "last_hp": None, "last_hit": -99.0}
 nav = {"side": 1, "until": 0.0, "last_pos": None, "stuck": 0, "last_t": -1.0}
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
@@ -622,6 +623,47 @@ def laser_dodge(o, me, enemies):
     return [-uy * s, ux * s]
 
 
+def combat_escape(o, me, enemies, cx, cy, radius):
+    """Select a safe lateral escape from multiple close threats.
+
+    A short sideways boost is more useful than running directly away from a
+    squad, which exposes the rear armor to 1.5x damage.
+    """
+    px, py = me["pos"][:2]
+    nearby = [m for m in enemies if math.hypot(m["pos"][0]-px, m["pos"][1]-py) < 115]
+    if len(nearby) < 2:
+        return None
+    # Threat direction weighted by proximity, so nearby enemies matter most.
+    tx = ty = 0.0
+    for m in nearby:
+        dx, dy = m["pos"][0]-px, m["pos"][1]-py
+        d = max(10.0, math.hypot(dx, dy))
+        tx += dx/(d*d)
+        ty += dy/(d*d)
+    n = math.hypot(tx, ty)
+    if n < 1e-7:
+        return None
+    tx, ty = tx/n, ty/n
+    candidates = []
+    for side in (-1, 1):
+        # Diagonal escape combines retreat with a strafe, avoiding easy laser tracking.
+        ux, uy = -0.45*tx - 0.89*ty*side, -0.45*ty + 0.89*tx*side
+        n2 = math.hypot(ux, uy)
+        ux, uy = ux/n2, uy/n2
+        nx, ny = px+ux*12, py+uy*12
+        if math.hypot(nx-cx, ny-cy) > max(5.0, radius-7.0):
+            continue
+        if MAP["ok"] and (not in_terrain(nx, ny) or solid_at(nx, ny)):
+            continue
+        closest = min(math.hypot(nx-m["pos"][0], ny-m["pos"][1]) for m in nearby)
+        candidates.append((closest + (2.0 if side == evasion["side"] else 0), side, ux, uy))
+    if not candidates:
+        return None
+    _, side, ux, uy = max(candidates)
+    evasion["side"] = side
+    return [ux, uy]
+
+
 def mobility(o, me, act, want_up, fleeing, hit_now):
     """Jump when we are pushing against something and not moving; jet if the goal is higher."""
     now = o["t"]
@@ -634,15 +676,18 @@ def mobility(o, me, act, want_up, fleeing, hit_now):
         else:
             mob["blocked"] = 0
         if now >= mob["jump_cd"]:
-            if mob["blocked"] >= 4:                  # ~0.4 s of pushing without moving
+            if mob["blocked"] >= 4 or (want_up and nav["stuck"] >= 2):                  # ~0.4 s of pushing without moving
                 act["jump"] = True
                 mob["jump_cd"] = now + 1.0
                 mob["blocked"] = 0
                 if want_up:
                     mob["climb_until"] = now + 1.2
-            elif HOP_ON_HIT and fleeing and hit_now and spd > 4.0:
+            elif (fleeing and hit_now and spd > 3.0 and me["energy"] > 30
+                  and now - evasion["last_hit"] > 0.8):
+                # One defensive hop when caught in sustained fire; don't spam jumps.
                 act["jump"] = True
-                mob["jump_cd"] = now + 2.0
+                mob["jump_cd"] = now + 2.5
+                evasion["last_hit"] = now
     elif now < mob["climb_until"] and me["energy"] > 25:
         act["boost"] = True                          # in the air: jet until the feet clear the edge
 
@@ -658,8 +703,10 @@ def decide(o):
 
     update_memory(o, px, py, pz)
     now = o["t"]
-    hit_now = any(e.get("type") == "damaged" and e.get("by") is not None
+    hp_drop = (evasion["last_hp"] is not None and me["hp"] < evasion["last_hp"] - 0.1)
+    hit_now = hp_drop or any(e.get("type") == "damaged" and e.get("by") is not None
                   for e in o.get("events", []))
+    evasion["last_hp"] = me["hp"]
     fleeing = False
     want_up = False
 
@@ -746,6 +793,12 @@ def decide(o):
                          dist < gun["stats"].get("range", 230) - 3 and
                          not laser_ready)
             firing_gun = fire0
+        # Avoid firing into solid walls: wasted shots also interrupt regeneration.
+        if (fire0 or fire1) and MAP["ok"]:
+            muzzle = (px, py, pz + me["stats"].get("muzzle_height", 7))
+            target = (t["pos"][0], t["pos"][1], t["pos"][2] + 4.5)
+            if los_blocked(muzzle, target):
+                fire0 = fire1 = False
         if avoid and dist >= 40:       # don't provoke or reset regen unless they are on top of us
             fire0 = fire1 = False
         act["fire"] = [fire0, fire1]
@@ -799,11 +852,24 @@ def decide(o):
                     act["move"] = [mx / n, my / n]
                 else:
                     act["move"] = [sx, sy]
+        # When surrounded, prioritize creating distance rather than circling one enemy.
+        escape = combat_escape(o, me, enemies, cx, cy, z["next_radius"]) if inside else None
+        if escape is not None and (hit_now or me["hp"] < 0.72 * me["max_hp"]):
+            fleeing = True
+            act["move"] = escape
+            if me["energy"] > 40:
+                act["boost"] = True
         dv = laser_dodge(o, me, enemies)
         if dv is not None:                  # a charging laser is lined up on us: sprint sideways
             act["move"] = dv
             if me["energy"] > 25:
                 act["boost"] = True
+            # A jump changes vertical aim during the laser charge. Use only when
+            # already moving, with energy to spare, and outside the jump cooldown.
+            if (me["grounded"] and now >= mob["jump_cd"] and me["energy"] > 45
+                    and math.hypot(*me["vel"][:2]) > 3.0):
+                act["jump"] = True
+                mob["jump_cd"] = now + 3.0
     else:
         # shot by a mech we cannot see: treat the bearing as a threat and take cover
         if inside:
