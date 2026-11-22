@@ -38,8 +38,8 @@ mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0,
 nav = {"side": 1, "until": 0.0, "last_pos": None, "stuck": 0, "last_t": -1.0}
 route = {"key": None, "goal": None, "waypoints": deque(), "retry": 0.0,
          "best": math.inf, "progress": 0.0, "next_limit": 0.0}
-contacts_memory = {}
-combat = {"target": None, "target_until": 0.0, "disengage_until": 0.0}
+recent_attackers = {}
+crossfire = {"target": None, "target_pos": None, "target_until": 0.0, "retreat_until": 0.0}
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
 # Upgrade ranking by id (higher = better), from the real hello.config.upgrades list.
@@ -269,49 +269,7 @@ def weapon_shot(me, weapon, target):
                 min(0.18, math.atan2(0.42 * height, horizontal)))
 
 
-def risks_second_hit(me, weapon, shot, target, robots):
-    """Withhold splash, chaining, or piercing shots near another robot."""
-    kind = weapon["kind"]
-    stats = weapon["stats"]
-    if kind == "mortar":
-        radius = stats.get("splash_radius", 7.0) + 5.0
-    elif kind == "lightning":
-        radius = stats.get("chain_range", 14.0) + 3.0
-    elif kind == "laser" and stats.get("pierce", 0):
-        radius = 4.0
-    else:
-        return False
-    start = me["pos"][:2]
-    end = target["pos"][:2]
-    for robot in robots:
-        if robot["id"] == target["id"]:
-            continue
-        point = robot["pos"][:2]
-        if kind == "mortar":
-            # Check the current and near-future spacing of the two robots.
-            flight = min(2.0, math.dist(start, end) / stats.get("speed", 72.0))
-            tv = target.get("vel", (0, 0, 0))
-            rv = robot.get("vel", (0, 0, 0))
-            delta = (point[0] - end[0], point[1] - end[1])
-            future = tuple(delta[i] + (rv[i] - tv[i]) * flight for i in range(2))
-            if segment_separation(delta, future, (0, 0)) <= radius:
-                return True
-        elif kind == "lightning":
-            if math.dist(point, end) <= radius:
-                return True
-            bearing = math.atan2(point[1] - start[1], point[0] - start[0])
-            if (math.dist(start, point) < math.dist(start, end)
-                    and abs(wrap(shot.yaw - bearing)) <= math.radians(stats.get("cone_deg", 30))):
-                return True
-        elif math.dist(start, point) <= stats.get("range", 280.0):
-            reach = stats.get("range", 280.0)
-            beam_end = start[0] + reach * math.cos(shot.yaw), start[1] + reach * math.sin(shot.yaw)
-            if segment_separation(start, beam_end, point) <= radius:
-                return True
-    return False
-
-
-def fire_weapons(me, act, target, allow_fire=True, allow_charge=True, robots=()):
+def fire_weapons(me, act, target, allow_fire=True, allow_charge=True):
     """Coordinate the shared torso aim and independent trigger for each slot."""
     weapons = me["weapons"]
     current_aim = me["aim"]
@@ -319,7 +277,7 @@ def fire_weapons(me, act, target, allow_fire=True, allow_charge=True, robots=())
     default_height = 4.5 if target.get("kind") == "mech" else 1.4
     act["aim"] = aim_toward(me, target["pos"], default_height)
     if not allow_fire:
-        return 0.0
+        return
 
     shots = []
     ready = []
@@ -334,9 +292,8 @@ def fire_weapons(me, act, target, allow_fire=True, allow_charge=True, robots=())
             available = available and (allow_charge or weapon.get("charge", 0) > 0)
         ready.append(available)
         # Wait until a shell is nearly ready before tracing an expensive arc.
-        shot = (weapon_shot(me, weapon, target)
-                if weapon and (kind != "mortar" or weapon["cooldown"] <= 0.25) else None)
-        shots.append(None if shot and risks_second_hit(me, weapon, shot, target, robots) else shot)
+        shots.append(weapon_shot(me, weapon, target)
+                     if weapon and (kind != "mortar" or weapon["cooldown"] <= 0.25) else None)
 
     candidates = [i for i, shot in enumerate(shots) if shot and ready[i]]
     # An already-charging laser owns the aim through release. A compatible gun
@@ -361,7 +318,7 @@ def fire_weapons(me, act, target, allow_fire=True, allow_charge=True, robots=())
         shot = next((shot for shot in shots if shot), None)
         if shot:
             act["aim"] = [shot.yaw, shot.pitch]
-        return 0.20 if shot else 0.0
+        return
 
     shot = shots[selected]
     act["aim"] = [shot.yaw, shot.pitch]
@@ -381,50 +338,6 @@ def fire_weapons(me, act, target, allow_fire=True, allow_charge=True, robots=())
                 act["fire"][i] = on_target and allow_charge
         else:
             act["fire"][i] = on_target
-    return max(0.25, score(selected)) + 0.20 * sum(act["fire"])
-
-
-def choose_combat_aim(o, me, act, nearest, enemies, robots, contacts,
-                      allow_fire, allow_charge):
-    """Use V8G's firing policy on one target, with a small preference for continuity."""
-    if not allow_fire:
-        fire_weapons(me, act, nearest, allow_fire=False)
-        return
-
-    point = me["pos"][:2]
-    candidates = sorted((m for m in enemies if not contacts or m["id"] in contacts),
-                        key=lambda m: math.dist(point, m["pos"][:2]))
-    if not candidates:
-        fire_weapons(me, act, nearest, allow_fire=False)
-        return
-
-    now = o["t"]
-    deadline = time.perf_counter() + 0.006
-    best = -math.inf
-    for i, target in enumerate(candidates[:3]):
-        if i and time.perf_counter() >= deadline:
-            break
-        plan = {}
-        value = fire_weapons(me, plan, target, allow_charge=allow_charge, robots=robots)
-        distance = math.dist(point, target["pos"][:2])
-        retained = target["id"] == combat["target"] and now <= combat["target_until"]
-        score = value - 0.008 * distance + (0.24 if retained and value > 0 else 0.0)
-        if score > best:
-            best, selected, action = score, target, plan
-    combat.update(target=selected["id"], target_until=now + 0.7)
-    act.update(action)
-    remember_engagement(now, me, act, selected)
-
-
-def remember_engagement(now, me, act, target):
-    """Keep a fired-on robot in the contact set while a shot may be in flight."""
-    fired = [w["kind"] for w, trigger in zip(me["weapons"], act["fire"]) if w and trigger]
-    if not fired:
-        return
-    robot_id = target["id"]
-    previous_until = contacts_memory.get(robot_id, (now, None))[0]
-    duration = 3.5 if "mortar" in fired else 1.0
-    contacts_memory[robot_id] = max(previous_until, now + duration), tuple(target["pos"])
 
 
 def reload_gun(me, act):
@@ -434,6 +347,12 @@ def reload_gun(me, act):
             ammo = weapon["ammo"]
             if ammo == 0 or (not fire[i] and ammo < weapon["stats"]["mag"] // 2):
                 act["reload"] = True
+
+
+def remember_engagement(now, act, target):
+    if any(act["fire"]):
+        crossfire.update(target=target["id"], target_pos=tuple(target["pos"]),
+                         target_until=now + 1.0)
 
 
 def update_memory(o, px, py, pz):
@@ -471,7 +390,7 @@ def update_memory(o, px, py, pz):
                 ignore[("p", e["id"])] = 1e9
 
 
-def loot(o, me, act, held, z, cx, cy, contacts=None):
+def loot(o, me, act, held, z, cx, cy, enemies_none=True):
     """Prioritize reachable pickups/cubes, actively break crates for loot, then farm NPCs."""
     px, py, pz = me["pos"]
     now = o["t"]
@@ -528,7 +447,7 @@ def loot(o, me, act, held, z, cx, cy, contacts=None):
             cands.append((20 + d + risk(c["pos"]) + cube_danger,
                           ("c", c["id"]), c, "cube", 0.5))
     for m in o.get("mechs", []):
-        if m["kind"] == "npc" and (not contacts or m["id"] in contacts):
+        if m["kind"] == "npc":
             d = math.hypot(m["pos"][0] - px, m["pos"][1] - py)
             if d < 90 and ok(m["pos"], ("n", m["id"])):
                 cands.append((135 + d + risk(m["pos"]), ("n", m["id"]), m, "npc", 28.0))
@@ -594,10 +513,9 @@ def loot(o, me, act, held, z, cx, cy, contacts=None):
             return False
         fire_weapons(me, act, tgt, allow_fire=d < 115.0,
                      allow_charge=d <= standoff + 4.0 and
-                     not any(m.get("charging") for m in nearby_players),
-                     robots=[m for m in o["mechs"] if m["id"] != me["id"]])
+                     not any(m.get("charging") for m in nearby_players))
         if kind == "npc":
-            remember_engagement(now, me, act, tgt)
+            remember_engagement(now, act, tgt)
         # Don't run into targets; advance until within accurate gun range.
         act["move"] = [dx / d, dy / d] if d > standoff or not clear else [0, 0]
         return True
@@ -1281,88 +1199,119 @@ def safe_zone_route(o, me, enemies, cx, cy, radius):
     return best_dir
 
 
-def active_contacts(o, me, robots):
-    """Track nearby robots and recent participants even if they leave view."""
+def beam_intersection(start, end, me):
+    """Find a point on a beam segment inside the mech's padded collision cylinder."""
+    px, py, pz = me["pos"]
+    radius = me["stats"].get("radius", 2.5) + 1.0
+    bottom, top = pz - 0.5, pz + me["stats"].get("height", 9.0) + 0.5
+    dx, dy, dz = (end[i] - start[i] for i in range(3))
+    first, last = 0.0, 1.0
+    if abs(dz) > 1e-6:
+        low, high = sorted(((bottom - start[2]) / dz, (top - start[2]) / dz))
+        first, last = max(first, low), min(last, high)
+    elif not bottom <= start[2] <= top:
+        return None
+    if first > last:
+        return None
+    horizontal = dx * dx + dy * dy
+    nearest = ((px - start[0]) * dx + (py - start[1]) * dy) / (horizontal or 1.0)
+    fraction = max(first, min(last, nearest))
+    x, y = start[0] + fraction * dx, start[1] + fraction * dy
+    if math.hypot(x - px, y - py) <= radius:
+        return x, y, start[2] + fraction * dz
+    return None
+
+
+def aimed_charge(robot, me):
+    if not robot.get("charging"):
+        return False
+    yaw, pitch = robot["aim"]
+    x, y, z = robot["pos"]
+    start = x, y, z + 7.0 * (1.0 + 0.05 * robot.get("cubes", 0))
+    reach = CFG.get("weapons", {}).get("laser", {}).get("range", 280.0)
+    horizontal = reach * math.cos(pitch)
+    end = x + horizontal * math.cos(yaw), y + horizontal * math.sin(yaw), start[2] + reach * math.sin(pitch)
+    contact = beam_intersection(start, end, me)
+    return contact is not None and (not MAP["ok"] or not los_blocked(start, contact))
+
+
+def crossfire_threats(o, me):
+    """Detect overlapping attacks from identified robots, plus our current engagement."""
     now = o["t"]
     px, py, pz = me["pos"]
-    eye = px, py, pz + me["stats"].get("eye_height", 8.0)
-    killed = {e["target"] for e in o.get("events", ()) if e["type"] == "kill"}
-    observed = {robot["id"]: robot for robot in robots if robot["id"] not in killed}
-    for robot_id, (until, _) in list(contacts_memory.items()):
+    events = o.get("events", ())
+    killed = {e["target"] for e in events if e["type"] == "kill"}
+    robots = {m["id"]: m for m in o["mechs"]
+              if m["id"] != me["id"] and m["id"] not in killed}
+    for robot_id, (until, _) in list(recent_attackers.items()):
         if until <= now or robot_id in killed:
-            del contacts_memory[robot_id]
+            del recent_attackers[robot_id]
 
-    for robot_id, robot in observed.items():
-        x, y, z = robot["pos"]
-        distance = math.hypot(x - px, y - py)
-        drone = robot["kind"] == "npc"
-        near, reach = (23.0, 53.0) if drone else (67.0, 168.0)
-        if not drone and reach < distance <= 270.0:
-            bearing = math.atan2(py - y, px - x)
-            if abs(wrap(robot["aim"][0] - bearing)) < 0.16:
-                reach = 270.0 if robot.get("charging") else 233.0
-        sight = distance <= reach and (not MAP["ok"] or
-                not los_blocked(eye, (x, y, z + (1.75 if drone else 5.0))))
-        previous = contacts_memory.get(robot_id)
-        if distance <= near or sight:
-            until = max(now + 0.75, previous[0] if previous else now)
-            contacts_memory[robot_id] = until, tuple(robot["pos"])
-        elif previous:
-            contacts_memory[robot_id] = previous[0], tuple(robot["pos"])
-
-    for e in o.get("events", ()):
-        if e["type"] == "damaged":
-            robot_id = e.get("by")
-        elif e["type"] == "hit":
-            robot_id = e.get("target")
-        else:
+    for e in events:
+        robot_id = e.get("by")
+        if (e["type"] != "damaged" or robot_id is None
+                or robot_id == me["id"] or robot_id in killed):
             continue
-        robot_id_ok = robot_id is not None and (0 <= robot_id < 16 or 100 <= robot_id < 1000)
-        if not robot_id_ok or robot_id == me["id"] or robot_id in killed:
-            continue
-        if robot_id in observed:
-            point = tuple(observed[robot_id]["pos"])
+        if robot_id in robots:
+            point = tuple(robots[robot_id]["pos"])
         elif e.get("bearing") is not None:
             angle = e["bearing"]
             x, y = px + 70 * math.cos(angle), py + 70 * math.sin(angle)
             point = x, y, ground_z(x, y, pz)
         else:
-            point = contacts_memory.get(robot_id, (now, None))[1]
-        contacts_memory[robot_id] = now + 2.3, point
-    return {robot_id: point for robot_id, (_, point) in contacts_memory.items()}
+            point = recent_attackers.get(robot_id, (now, None))[1]
+        recent_attackers[robot_id] = now + 1.5, point
+
+    for beam in o.get("beams", ()):
+        robot_id, age, path = beam.get("by"), beam.get("age", 0), beam["path"]
+        if robot_id is None or robot_id == me["id"] or robot_id in killed or age > 0.35:
+            continue
+        if any(beam_intersection(a, b, me) is not None for a, b in zip(path, path[1:])):
+            point = tuple(robots[robot_id]["pos"]) if robot_id in robots else tuple(path[0])
+            until = max(now + 1.5 - age, recent_attackers.get(robot_id, (now, None))[0])
+            recent_attackers[robot_id] = until, point
+
+    active = {i: tuple(robots[i]["pos"]) if i in robots else point
+              for i, (_, point) in recent_attackers.items()}
+    for robot_id, robot in robots.items():
+        if aimed_charge(robot, me):
+            active[robot_id] = tuple(robot["pos"])
+
+    target = crossfire["target"]
+    if active and target is not None and target not in killed and now < crossfire["target_until"]:
+        active.setdefault(target, tuple(robots[target]["pos"]) if target in robots else crossfire["target_pos"])
+    if len(active) >= 2:
+        crossfire["retreat_until"] = now + 0.45
+    return [point for point in active.values() if point is not None]
 
 
-def break_contact(o, me, points, fallback):
-    """Choose a passable heading that maximizes room from the nearest pursuer."""
+def crossfire_heading(o, me, points, fallback):
+    """Find a clear short step away from attackers while staying within zone limits."""
     if not points:
         return fallback
     start = tuple(me["pos"][:2])
-    zone = o["zone"]
-    center = tuple(zone["next_center"])
-    current_center = tuple(zone["center"])
-    current_limit = max(math.dist(start, current_center), zone["radius"])
-    next_limit = max(math.dist(start, center), 0.93 * zone["next_radius"]) + 1.0
+    z = o["zone"]
+    current, future = z["center"], z["next_center"]
+    future_limit = max(math.dist(start, future), 0.94 * z["next_radius"]) + 1.0
     positions = [point[:2] for point in points]
     vx, vy = me["vel"][:2]
-    origin = math.atan2(fallback[1], fallback[0])
-    best_score, best = -math.inf, None
+    best = None
     for i in range(12):
-        angle = origin + i * math.tau / 12
+        angle = i * math.tau / 12
         ux, uy = math.cos(angle), math.sin(angle)
-        end = start[0] + 12 * ux, start[1] + 12 * uy
-        if math.dist(end, current_center) > current_limit or math.dist(end, center) > next_limit:
+        end = start[0] + 11 * ux, start[1] + 11 * uy
+        if math.dist(end, current) > z["radius"] or math.dist(end, future) > future_limit:
             continue
         if MAP["ok"] and not walkable_segment(start, end):
             continue
-        spacing = min(math.dist(end, point) for point in positions)
-        approach = min(segment_separation(start, end, point) for point in positions)
-        score = (spacing + 0.45 * approach + 0.15 * (vx * ux + vy * uy)
-                 - 0.20 * max(0.0, math.dist(end, center) - 0.72 * zone["next_radius"]))
-        if score > best_score:
-            best_score, best = score, [ux, uy]
+        nearest = min(math.dist(end, p) for p in positions)
+        approach = min(segment_separation(start, end, p) for p in positions)
+        score = nearest + 0.45 * approach + 0.12 * (vx * ux + vy * uy)
+        score -= 0.18 * max(0.0, math.dist(end, future) - 0.72 * z["next_radius"])
+        if best is None or score > best[0]:
+            best = score, ux, uy
     if best is not None:
-        return best
-    # The local steering fallback can handle narrow openings missed by the samples.
+        return list(best[1:])
     nearest = min(positions, key=lambda p: math.dist(start, p))
     dx, dy = start[0] - nearest[0], start[1] - nearest[1]
     distance = math.hypot(dx, dy)
@@ -1397,9 +1346,7 @@ def decide(o):
     else:
         act["move"] = [0, 0]
 
-    robots = [m for m in o["mechs"] if m["id"] != me["id"] and m.get("hp", 1) != 0]
-    enemies = [m for m in robots if m["kind"] == "mech"]
-    contacts = active_contacts(o, me, robots)
+    enemies = [m for m in o["mechs"] if m["kind"] == "mech" and m["id"] != me["id"]]
     dv = laser_dodge(o, me, enemies)
     bullet_move, jump_dodge = projectile_dodge(o, me) if dv is None else (None, False)
     evade = dv if dv is not None else bullet_move
@@ -1409,29 +1356,26 @@ def decide(o):
               (distance_to_zone > 0 and now >= z["shrink_start"]
                and distance_to_zone / walk_speed + 2.0 > z["shrink_end"] - now))
 
-    if len(contacts) >= 2:
-        combat["disengage_until"] = now + 0.6
-    if now < combat["disengage_until"]:
-        points = [point for point in contacts.values() if point is not None]
+    attackers = crossfire_threats(o, me)
+    if now < crossfire["retreat_until"]:
         if evade is not None:
             desired = evade
             act["move"] = steer_around(o, me, desired)
         elif urgent or not inside:
-            pursuit = [{"pos": point} for point in points]
-            desired = safe_zone_route(o, me, pursuit, cx, cy, z["next_radius"])
-            act["move"] = move_with_route(o, me, desired, goal, route_key, pursuit)
+            pursuers = [{"pos": p} for p in attackers]
+            desired = safe_zone_route(o, me, pursuers, cx, cy, z["next_radius"])
+            act["move"] = move_with_route(o, me, desired, goal, route_key, pursuers)
         else:
-            desired = act["move"] = break_contact(o, me, points, act["move"])
+            desired = act["move"] = crossfire_heading(o, me, attackers, act["move"])
         mobility(o, me, act, desired, want_up=False, fleeing=True,
                  evading=evade is not None, jump_dodge=jump_dodge, urgent=urgent)
         act["fire"] = [False, False]
-        if points:
-            point = min(points, key=lambda p: math.hypot(p[0] - px, p[1] - py))
+        if attackers:
+            point = min(attackers, key=lambda p: math.hypot(p[0] - px, p[1] - py))
             act["aim"] = list(aim_toward(me, point, 4.5))
         if any(w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in me["weapons"]):
-            # Releasing a primed laser can still emit a beam; point it into the ground.
-            yaw = act.get("aim", me["aim"])[0]
-            act["aim"] = [yaw, me["stats"].get("min_pitch", -0.7)]
+            # Releasing a primed laser can emit a beam during the turn.
+            act["aim"] = [act.get("aim", me["aim"])[0], me["stats"].get("min_pitch", -0.7)]
         reload_gun(me, act)
         return act
 
@@ -1443,7 +1387,7 @@ def decide(o):
         # Baseline V1 survival thresholds retained; do not repeat V2's broad retreat policy.
         # Distant enemies should not prevent safe farming and collecting upgrades.
         if inside and dist > 75 and not hit_now and evade is None and now < 180:
-            if loot(o, me, act, held, z, cx, cy, contacts):
+            if loot(o, me, act, held, z, cx, cy):
                 desired = act["move"]
                 act["move"] = move_with_route(o, me, desired, chase["goal"],
                                               chase["key"], enemies)
@@ -1538,7 +1482,7 @@ def decide(o):
             act["move"] = [ddx / dd, ddy / dd] if dd > 3.0 else [0, 0]
             acted = True
         else:
-            acted = inside and evade is None and loot(o, me, act, held, z, cx, cy, contacts)
+            acted = inside and evade is None and loot(o, me, act, held, z, cx, cy)
             want_up = acted and chase["tz"] is not None and chase["tz"] - pz > 1.0
             if acted:
                 goal, route_key = chase["goal"], chase["key"]
@@ -1557,9 +1501,9 @@ def decide(o):
     mobility(o, me, act, desired, want_up, fleeing, evade is not None,
              jump_dodge, urgent and route_key == "zone")
     if enemies:
-        choose_combat_aim(o, me, act, t, enemies, robots, contacts,
-                         allow_fire=not (avoid and dist >= 40),
-                         allow_charge=evade is None and not (fleeing or urgent or hit_now))
+        fire_weapons(me, act, t, allow_fire=not (avoid and dist >= 40),
+                     allow_charge=evade is None and not (fleeing or urgent or hit_now))
+        remember_engagement(now, act, t)
     reload_gun(me, act)
 
     return act
@@ -1574,7 +1518,7 @@ def main():
     CFG = hello.get("config", {})
     RNG = random.Random(hello.get("seed", 0))
     load_map(hello)
-    send({"type": "ready", "name": "mech-royale-v8i"})
+    send({"type": "ready", "name": "mech-royale-v8j"})
 
     while True:
         m = q.get()
