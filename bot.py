@@ -35,6 +35,7 @@ cover = {"pt": None, "plan_t": -99.0, "hold_until": 0.0, "hidden": False}
 dodge = {"until": 0.0, "side": 1}
 MAP = {"ok": False}
 mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0}
+nav = {"side": 1, "until": 0.0, "last_pos": None, "stuck": 0, "last_t": -1.0}
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
 # Upgrade ranking by id (higher = better), from the real hello.config.upgrades list.
@@ -392,15 +393,100 @@ def solid_at(x, y):
 
 
 def path_clear(ax, ay, bx, by, max_len=None):
-    full = math.hypot(bx - ax, by - ay) or 1.0
+    """Check the requested segment without stepping past its endpoint."""
+    full = math.hypot(bx - ax, by - ay)
+    if full < 1e-6:
+        return True
     d = min(full, max_len) if max_len is not None else full
-    n = max(1, int(d / 2.0))
+    n = max(1, int(math.ceil(d / 2.0)))
     ux, uy = (bx - ax) / full, (by - ay) / full
     for k in range(1, n + 1):
-        x, y = ax + ux * 2.0 * k, ay + uy * 2.0 * k
+        step = d * k / n
+        x, y = ax + ux * step, ay + uy * step
         if not in_terrain(x, y) or solid_at(x, y):
             return False
     return True
+
+
+def nav_passable(x, y, z0):
+    """Conservative collision test: mech radius, height, and terrain steps."""
+    if not in_terrain(x, y):
+        return False
+    gz = ground(x, y)
+    if gz - z0 > 1.45:  # world.rules.maxStep is 1.5 m
+        return False
+    for ox, oy in ((0, 0), (2.7, 0), (-2.7, 0), (0, 2.7), (0, -2.7),
+                   (1.9, 1.9), (-1.9, 1.9), (1.9, -1.9), (-1.9, -1.9)):
+        xx, yy = x + ox, y + oy
+        if not in_terrain(xx, yy):
+            return False
+        if inside_prism(xx, yy, gz + 1.5) or inside_prism(xx, yy, gz + 8.5):
+            return False
+    return True
+
+
+def steer_around(o, me, desired):
+    """Local obstacle avoidance for every movement mode, with a stable detour side.
+
+    Tests short candidate arcs instead of requiring a straight path to a far goal.
+    This is local steering, not a full global pathfinder.
+    """
+    if not MAP["ok"]:
+        return desired
+    vx, vy = desired
+    mag = math.hypot(vx, vy)
+    if mag < 0.1:
+        return desired
+    vx, vy = vx / mag, vy / mag
+    px, py, pz = me["pos"]
+    now = o["t"]
+    if nav["last_pos"] is not None and now - nav["last_t"] >= 0.45:
+        travelled = math.hypot(px - nav["last_pos"][0], py - nav["last_pos"][1])
+        nav["stuck"] = nav["stuck"] + 1 if travelled < 1.3 else 0
+        nav["last_pos"], nav["last_t"] = (px, py), now
+    elif nav["last_pos"] is None:
+        nav["last_pos"], nav["last_t"] = (px, py), now
+
+    # Avoid steering into the imminent zone edge, but allow escape if already outside.
+    z = o["zone"]
+    cx, cy = z["next_center"]
+    limit = max(0.0, z["next_radius"] - 5.0)
+    currently_outside = math.hypot(px - cx, py - cy) > limit
+    base = math.atan2(vy, vx)
+    offsets = (0, 0.30, -0.30, 0.60, -0.60, 0.95, -0.95,
+               1.35, -1.35, 1.75, -1.75, 2.3, -2.3, math.pi)
+    best = None
+    for off in offsets:
+        angle = base + off
+        ux, uy = math.cos(angle), math.sin(angle)
+        free = 0.0
+        prev_z = ground_z(px, py, pz)
+        for dist in (3.5, 7.0, 11.0, 16.0):
+            x, y = px + ux * dist, py + uy * dist
+            if not nav_passable(x, y, prev_z):
+                break
+            if not currently_outside and math.hypot(x - cx, y - cy) > limit:
+                break
+            if currently_outside and math.hypot(x - cx, y - cy) > math.hypot(px - cx, py - cy) + 2:
+                break
+            prev_z = ground(x, y)
+            free = dist
+        if free < 3.5:
+            continue
+        # Favor forward progress; commit to a side when detouring to avoid oscillation.
+        score = free * 0.11 + 5.0 * math.cos(off) - 0.5 * abs(off)
+        if now < nav["until"] and off * nav["side"] > 0:
+            score += 1.5
+        if nav["stuck"] >= 2 and abs(off) > 0.6:
+            score += 3.0
+        if best is None or score > best[0]:
+            best = (score, ux, uy, off)
+    if best is None:
+        return [0.0, 0.0]
+    if abs(best[3]) > 0.3:
+        nav["side"] = 1 if best[3] > 0 else -1
+        nav["until"] = now + 2.0
+    return [best[1] * mag, best[2] * mag]
 
 
 def plan_cover(o, me, threats, cx, cy, nr, force=False):
@@ -694,6 +780,9 @@ def decide(o):
             if hits:
                 act["aim"] = [hits[-1]["bearing"], 0]
 
+    # Apply obstacle avoidance to zone travel, loot chasing, combat and retreat.
+    # Do not override intentional stationary actions (healing or shooting from cover).
+    act["move"] = steer_around(o, me, act.get("move", [0, 0]))
     mobility(o, me, act, want_up, fleeing, hit_now)
 
     # reload when empty, or when idle and under half a magazine
