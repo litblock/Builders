@@ -38,9 +38,11 @@ mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0,
 nav = {"side": 1, "until": 0.0, "last_pos": None, "stuck": 0, "last_t": -1.0}
 route = {"key": None, "goal": None, "waypoints": deque(), "retry": 0.0,
          "best": math.inf, "progress": 0.0, "next_limit": 0.0}
-zone_loot = {"id": None, "until": 0.0, "retry": 0.0, "hit_until": 0.0}
-ZONE_LOOT_S = 1.0
-ZONE_LOOT_RESERVE_S = 4.0
+zone_recovery = {"phase": None, "point": None, "waypoint": False, "best": 0.0,
+                 "progress": 0.0, "last": -1.0, "avoid": None, "avoid_until": 0.0,
+                 "hop": None, "hop_until": 0.0, "heading": None}
+ZONE_STALL_S = 1.0
+FAILED_SEGMENT_RADIUS = 8.0
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
 # Upgrade ranking by id (higher = better), from the real hello.config.upgrades list.
@@ -675,7 +677,7 @@ def nav_passable(x, y, z0):
     return True
 
 
-def steer_around(o, me, desired):
+def steer_around(o, me, desired, avoid_point=None):
     """Local obstacle avoidance for every movement mode, with a stable detour side.
 
     Tests short candidate arcs instead of requiring a straight path to a far goal.
@@ -725,6 +727,9 @@ def steer_around(o, me, desired):
             continue
         # Favor forward progress; commit to a side when detouring to avoid oscillation.
         score = free * 0.11 + 5.0 * math.cos(off) - 0.5 * abs(off)
+        if avoid_point is not None:
+            end = px + ux * min(free, 8.0), py + uy * min(free, 8.0)
+            score -= 6.0 * failed_segment_weight((px, py), end, avoid_point)
         if now < nav["until"] and off * nav["side"] > 0:
             score += 1.5
         if nav["stuck"] >= 2 and abs(off) > 0.6:
@@ -773,7 +778,11 @@ def contested_segment(start, end, enemies):
     return False
 
 
-def plan_route(start, goal, circles, enemies, partial):
+def failed_segment_weight(start, end, point):
+    return max(0.0, 1.0 - segment_separation(start, end, point) / FAILED_SEGMENT_RADIUS)
+
+
+def plan_route(start, goal, circles, enemies, partial, avoid_point=None):
     """Bounded A* on a local grid anchored at the mech's current position."""
     deadline = time.perf_counter() + 0.012
     goal_distance = math.dist(start, goal)
@@ -800,6 +809,8 @@ def plan_route(start, goal, circles, enemies, partial):
         if remaining < best_distance:
             best, best_distance = node, remaining
         if (node != (0, 0) and remaining <= 9.0 and inside_limits(goal)
+                and (avoid_point is None or remaining <= ROUTE_GRID / 2
+                     or failed_segment_weight(here, goal, avoid_point) == 0)
                 and walkable_segment(here, goal)):
             best, reached = node, True
             break
@@ -817,6 +828,8 @@ def plan_route(start, goal, circles, enemies, partial):
             separation = min((segment_separation(here, there, p) for p in threats),
                              default=math.inf)
             new_cost += step * max(0.0, 45.0 - separation) / 25.0
+            if avoid_point is not None:
+                new_cost += 2.5 * step * failed_segment_weight(here, there, avoid_point)
             if new_cost >= costs.get(other, math.inf) or not walkable_segment(here, there):
                 continue
             costs[other] = new_cost
@@ -833,10 +846,23 @@ def plan_route(start, goal, circles, enemies, partial):
     return waypoints
 
 
-def move_with_route(o, me, desired, goal, key, enemies):
+def track_zone_point(start, point, now, waypoint, heading=None):
+    if zone_recovery["point"] is None:
+        zone_recovery["progress"] = now
+    if (zone_recovery["point"] is None or zone_recovery["waypoint"] != waypoint
+            or (waypoint and zone_recovery["point"] != point)):
+        zone_recovery.update(point=point, waypoint=waypoint, heading=heading,
+                             best=math.dist(start, point))
+
+
+def move_with_route(o, me, desired, goal, key, enemies, zone_action=None):
     """Follow cached waypoints when direct ground movement is blocked."""
     speed = math.hypot(*desired)
+    if zone_action is not None and zone_recovery["hop"] is not None:
+        return list(zone_recovery["hop"])
     if goal is None or not MAP["ok"] or not me["grounded"] or speed < 0.1:
+        if zone_action is not None:
+            zone_recovery["point"] = None
         return steer_around(o, me, desired)
 
     start = tuple(me["pos"][:2])
@@ -856,20 +882,60 @@ def move_with_route(o, me, desired, goal, key, enemies):
     next_radius = z["next_radius"]
     circles = ((current_center, max(z["radius"], current_distance)),
                (center, max(next_radius, next_distance + 2.0)))
+    stalled = False
+    avoid_point = None
+    if zone_action is not None:
+        if zone_recovery["phase"] != key:
+            zone_recovery.update(phase=key, point=None, avoid=None)
+        if now - zone_recovery["last"] > 0.35:
+            zone_recovery["point"] = None
+        zone_recovery["last"] = now
+        point = zone_recovery["point"]
+        if point is not None:
+            delta = point[0] - start[0], point[1] - start[1]
+            distance = math.hypot(*delta)
+            heading = zone_recovery["heading"]
+            # A steering lookahead is passed once we cross its plane. Only
+            # A* waypoints need us to reach a particular position.
+            remaining = distance if heading is None else sum(a * b for a, b in zip(delta, heading))
+            if remaining < 1.7:
+                zone_recovery["point"] = None
+            elif remaining < zone_recovery["best"] - 1.25:
+                zone_recovery.update(best=remaining, progress=now)
+            elif now - zone_recovery["progress"] >= ZONE_STALL_S:
+                direction = heading if heading is not None else (delta[0] / distance, delta[1] / distance)
+                flight = 0.0
+                if now >= mob["jump_cd"]:
+                    flight = zone_hop_flight(me, start, direction, circles, enemies)
+                if flight:
+                    zone_action["jump"] = True
+                    zone_recovery.update(point=None, hop=direction, hop_until=now + flight + 0.15,
+                                         avoid=None)
+                    mob.update(blocked=0, jump_cd=now + flight + 0.5, climb_until=now)
+                    route.update(waypoints=deque(), retry=now)
+                    return list(direction)
+                failed = tuple(start[i] + direction[i] * min(6.0, remaining) for i in range(2))
+                zone_recovery.update(point=None, avoid=failed, avoid_until=now + 4.0)
+                route["waypoints"].clear()
+                stalled = True
+        if now < zone_recovery["avoid_until"]:
+            avoid_point = zone_recovery["avoid"]
+
     waypoints = route["waypoints"]
     if waypoints and now - route["progress"] >= 2.0:
         waypoints.clear()
         route["retry"] = now + 0.8
-    if not waypoints and now >= route["retry"]:
+    if stalled or (not waypoints and now >= route["retry"]):
         dx, dy = (component / speed for component in desired)
         distance = math.dist(start, goal)
         look = min(16.0, distance)
         direct = start[0] + dx * look, start[1] + dy * look
-        if look > 2.0 and not walkable_segment(start, direct):
+        if look > 2.0 and (stalled or not walkable_segment(start, direct)):
             if distance > ROUTE_HORIZON:
                 goal = (start[0] + dx * ROUTE_HORIZON, start[1] + dy * ROUTE_HORIZON)
             waypoints = plan_route(start, goal, circles, enemies,
-                                   partial=key[0] == "zone" or distance > ROUTE_HORIZON)
+                                   partial=key[0] == "zone" or distance > ROUTE_HORIZON,
+                                   avoid_point=avoid_point)
             route.update(waypoints=waypoints, retry=now + 0.8,
                          best=math.inf, progress=now, next_limit=circles[1][1])
     while waypoints and math.dist(start, waypoints[0]) < 1.7:
@@ -886,9 +952,13 @@ def move_with_route(o, me, desired, goal, key, enemies):
                     and walkable_segment(start, point, resolution=0.8))
 
         # Cut a corner only when the full shortcut has clearance.
-        if len(waypoints) > 1 and math.dist(start, waypoints[1]) <= 14.0 and usable(waypoints[1]):
-            waypoints.popleft()
-            route.update(best=math.inf, progress=now)
+        if len(waypoints) > 1 and math.dist(start, waypoints[1]) <= 14.0:
+            shortcut = waypoints[1]
+            if ((avoid_point is None or (math.dist(start, avoid_point) > 2 * FAILED_SEGMENT_RADIUS
+                                        and failed_segment_weight(start, shortcut, avoid_point) == 0))
+                    and usable(shortcut)):
+                waypoints.popleft()
+                route.update(best=math.inf, progress=now)
         point = waypoints[0]
         if not usable(point):
             waypoints.clear()
@@ -897,8 +967,18 @@ def move_with_route(o, me, desired, goal, key, enemies):
             distance = math.dist(start, point)
             if distance < route["best"] - 1.0:
                 route.update(best=distance, progress=now)
+            if zone_action is not None:
+                track_zone_point(start, point, now, waypoint=True)
             return [(point[i] - start[i]) * speed / distance for i in range(2)]
-    return steer_around(o, me, desired)
+    movement = steer_around(o, me, desired, avoid_point)
+    if zone_action is not None:
+        heading = movement if math.hypot(*movement) > 0.1 else desired
+        magnitude = math.hypot(*heading)
+        heading = tuple(component / magnitude for component in heading)
+        distance = min(10.0, math.dist(start, center))
+        point = tuple(start[i] + heading[i] * distance for i in range(2))
+        track_zone_point(start, point, now, waypoint=False, heading=heading)
+    return movement
 
 
 def plan_cover(o, me, threats, cx, cy, nr, force=False):
@@ -1081,11 +1161,15 @@ def projectile_dodge(o, me):
     return movement, jump
 
 
-def air_clear(me, x, y, feet):
+def air_clear(me, x, y, feet, full_footprint=False):
     """Check the mech's footprint and torso clearance at a raised position."""
     radius = me["stats"].get("radius", 2.5)
     height = me["stats"].get("height", 9.0)
-    for dx, dy in ((0, 0), (radius, 0), (-radius, 0), (0, radius), (0, -radius)):
+    offsets = ((0, 0), (radius, 0), (-radius, 0), (0, radius), (0, -radius))
+    if full_footprint:
+        d = radius / math.sqrt(2)
+        offsets += ((d, d), (d, -d), (-d, d), (-d, -d))
+    for dx, dy in offsets:
         xx, yy = x + dx, y + dy
         if not in_terrain(xx, yy) or ground(xx, yy) > feet + 0.15:
             return False
@@ -1094,13 +1178,56 @@ def air_clear(me, x, y, feet):
     return True
 
 
-def mobility(o, me, act, desired, want_up, fleeing, evading, jump_dodge, urgent):
+def zone_hop_flight(me, start, direction, circles, enemies):
+    """Estimate a short unboosted hop and check clearance through touchdown."""
+    body, rules = me["stats"], CFG.get("mech", {})
+    gravity = body.get("gravity", rules.get("gravity", 22.0))
+    jump_speed = body.get("jump_speed", rules.get("jump_speed", 11.0))
+    dt = 1.0 / CFG.get("match", {}).get("tick_hz", 20)
+    flight = 2.0 * jump_speed / gravity
+    if not 0.25 <= flight <= 1.5:
+        return 0.0
+
+    walk_speed = body.get("walk_speed", rules.get("walk_speed", 11.7))
+    acceleration = body.get("air_accel", rules.get("air_accel", 12.0))
+    targets = [value * walk_speed for value in direction]
+    x, y, pz = me["pos"]
+    vx, vy = me["vel"][:2]
+    for step in range(1, math.ceil(flight / dt) + 2):
+        dx, dy = targets[0] - vx, targets[1] - vy
+        fraction = min(1.0, acceleration * dt / (math.hypot(dx, dy) or 1.0))
+        vx, vy = vx + fraction * dx, vy + fraction * dy
+        x, y = x + vx * dt, y + vy * dt
+        elapsed = step * dt
+        # Semi-implicit gravity gives a slightly lower arc than the analytic one.
+        rise = elapsed * (jump_speed - 0.5 * gravity * (elapsed + dt))
+        if (any(math.dist((x, y), center) > radius for center, radius in circles)
+                or not air_clear(me, x, y, pz + max(0.0, rise), full_footprint=True)):
+            return 0.0
+
+    landing = x, y
+    ahead = x + direction[0] * 2.0, y + direction[1] * 2.0
+    landing_z = ground(x, y)
+    if (math.dist(start, landing) < 4.0 or abs(landing_z - pz) > 0.6
+            or any(math.dist(ahead, center) > radius for center, radius in circles)
+            or not nav_passable(x, y, landing_z)
+            or not walkable_segment(landing, ahead, resolution=0.8)
+            or walkable_segment(start, landing, resolution=0.8)
+            or contested_segment(start, landing, enemies)):
+        return 0.0
+    return flight
+
+
+def mobility(o, me, act, desired, want_up, fleeing, evading, jump_dodge, urgent,
+             zone_travel=False):
     """Use energy for short sprints or intentional climbs."""
     now = o["t"]
     px, py, pz = me["pos"]
     vx, vy, vz = me["vel"]
     energy = me["energy"]
     mag = math.hypot(*desired)
+    if zone_travel and zone_recovery["hop"] is not None:
+        return
     if not me["grounded"]:
         # In the air boost adds lift, so keep it for an active climb.
         if (now < mob["climb_until"] and energy > 35
@@ -1124,7 +1251,7 @@ def mobility(o, me, act, desired, want_up, fleeing, evading, jump_dodge, urgent)
             ahead = px + 4 * dx, py + 4 * dy
             blocked = not MAP["ok"] or not walkable_segment((px, py), ahead)
             hop_height = me["stats"].get("jump_speed", 11.0) ** 2 / 44.0 - 0.35
-            low_ledge = MAP["ok"] and blocked and all(
+            low_ledge = not zone_travel and MAP["ok"] and blocked and all(
                 air_clear(me, px + d * dx, py + d * dy, pz + hop_height) for d in (2, 4, 6))
             climb = (MAP["ok"] and want_up and energy > 60 and blocked
                      and all(air_clear(me, px + d * dx, py + d * dy, pz + 4.0)
@@ -1192,106 +1319,6 @@ def safe_zone_route(o, me, enemies, cx, cy, radius):
     return best_dir
 
 
-def zone_weapon_detour(o, me, act, held, goal, walk_speed, distance_to_zone):
-    """Take an in-range weapon or briefly walk to one during safe zone travel."""
-    now = o["t"]
-    target = zone_loot["id"]
-    # An interrupted approach should not switch straight to another pickup.
-    # A validated approach below restores the target with its original deadline.
-    if target is not None:
-        zone_loot.update(id=None, retry=now + 3.0)
-    if (goal is None or held[1] is not None or not me["grounded"]
-            or now < zone_loot["hit_until"]
-            or (target is None and now < zone_loot["retry"])):
-        return None
-
-    pickups = o.get("pickups", ())
-    if not pickups:
-        return None
-    z = o["zone"]
-    slack = z["shrink_end"] - now - distance_to_zone / walk_speed - ZONE_LOOT_RESERVE_S
-    if slack <= 0:
-        return None
-    start = tuple(me["pos"][:2])
-    pz = me["pos"][2]
-    pickup_range = CFG.get("loot", {}).get("pickup_radius", 4.0)
-    threats = [(m["pos"][:2], 65.0 if m["kind"] == "mech" else 45.0)
-               for m in o["mechs"] if m["id"] != me["id"]]
-    if any(math.dist(start, pos) < radius for pos, radius in threats):
-        return None
-    gone = {e["id"] for e in o.get("events", ())
-            if e.get("type") == "take_failed" and e.get("reason") == "gone"}
-    candidates = []
-    for pickup in pickups:
-        pid = pickup["id"]
-        if ((target is not None and pid != target) or pid in gone
-                or pickup["kind"] in held or ignore.get(("p", pid), 0) > now):
-            continue
-        distance = math.dist(start, pickup["pos"][:2])
-        candidates.append((distance, WEAPON_RANK.get(pickup["kind"], 3), pid, pickup["pos"]))
-    candidates.sort()
-    for distance, _, pid, pos in candidates:
-        if distance <= pickup_range and abs(pos[2] - pz) <= 4.0:
-            act["take"] = pid
-            zone_loot["id"] = target
-            return None
-
-    remaining = ZONE_LOOT_S if target is None else zone_loot["until"] - now
-    approach_range = max(0.0, pickup_range - 0.35)
-    max_walk = remaining * walk_speed * 0.85
-    look = min(18.0, math.dist(start, goal))
-    if (not candidates or remaining <= 0 or not MAP["ok"] or look < 1.0
-            or candidates[0][0] > max_walk + approach_range):
-        return None
-    if abs(ground(*start) - pz) > 0.6:
-        return None  # use the terrain route only from ground level, not a roof
-    rejoin = tuple(start[i] + look * act["move"][i] for i in range(2))
-    if not walkable_segment(start, rejoin, resolution=0.8):
-        return None  # leave obstacle routing to the zone planner
-
-    # Check the approaching edge at the end of the pickup window. The circle
-    # contracts linearly from the current observation during the shrink.
-    shrink_now = max(now, z["shrink_start"])
-    future_time = min(z["shrink_end"], now + remaining + 0.3)
-    fraction = 0.0
-    if future_time > shrink_now:
-        fraction = (future_time - shrink_now) / (z["shrink_end"] - shrink_now)
-    future_center = tuple(a + fraction * (b - a) for a, b in zip(z["center"], goal))
-    future_radius = z["radius"] + fraction * (z["next_radius"] - z["radius"]) - 2.0
-    if max(math.dist(start, future_center), math.dist(rejoin, future_center)) > future_radius:
-        return None
-
-    best = None
-    for distance, rank, pid, pos in candidates:
-        if distance <= pickup_range:
-            continue  # already within horizontal range but above or below us
-        to_range = distance - approach_range
-        if to_range > max_walk:
-            break
-        direction = tuple((pos[i] - start[i]) / distance for i in range(2))
-        entry = tuple(start[i] + to_range * direction[i] for i in range(2))
-        extra_time = max(0.0, to_range + math.dist(entry, rejoin) - look) / walk_speed
-        if (extra_time > min(ZONE_LOOT_S, slack)
-                or math.dist(entry, goal) > math.dist(start, goal) + 1.0
-                or math.dist(entry, future_center) > future_radius
-                or any(min(segment_separation(start, entry, point),
-                           segment_separation(entry, rejoin, point)) < radius
-                       for point, radius in threats)
-                or not walkable_segment(start, entry, resolution=0.8)
-                or abs(pos[2] - ground(*entry)) > 3.5
-                or not walkable_segment(entry, rejoin, resolution=0.8)):
-            continue
-        candidate = (extra_time, distance, rank, pid, direction)
-        if best is None or candidate < best:
-            best = candidate
-    if best is None:
-        return None
-    zone_loot["id"] = best[3]
-    if target is None:
-        zone_loot["until"] = now + ZONE_LOOT_S
-    return best[4]
-
-
 def decide(o):
     me = o["self"]
     px, py, pz = me["pos"]
@@ -1305,8 +1332,6 @@ def decide(o):
     now = o["t"]
     hit_now = any(e.get("type") == "damaged" and e.get("by") is not None
                   for e in o.get("events", []))
-    if hit_now:
-        zone_loot["hit_until"] = now + 2.0
     fleeing = False
     want_up = False
 
@@ -1317,8 +1342,6 @@ def decide(o):
     route_key = "zone"
     zd = math.hypot(cx - px, cy - py) or 1.0
     inside = me["in_zone"] and zd < 0.85 * z["next_radius"]
-    if inside:
-        zone_loot["id"] = None
     if (not inside) or zd > 0.5 * z["next_radius"]:
         act["move"] = [(cx - px) / zd, (cy - py) / zd]
     else:
@@ -1328,6 +1351,12 @@ def decide(o):
     dv = laser_dodge(o, me, enemies)
     bullet_move, jump_dodge = projectile_dodge(o, me) if dv is None else (None, False)
     evade = dv if dv is not None else bullet_move
+    if evade is not None or me["grounded"] or now >= zone_recovery["hop_until"]:
+        zone_recovery["hop"] = None
+    if zone_recovery["hop"] is not None:
+        inside = False  # finish the checked landing even if the hop enters the zone
+    if inside or evade is not None:
+        zone_recovery["point"] = None
     walk_speed = max(1.0, me["stats"].get("walk_speed", 11.7))
     distance_to_zone = max(0.0, zd - z["next_radius"] + 5.0)
     urgent = (not me["in_zone"] or
@@ -1451,15 +1480,12 @@ def decide(o):
     if evade is not None:
         act["move"] = evade
         goal = None
-    detour = None
-    if not inside:
-        detour = zone_weapon_detour(o, me, act, held, None if urgent else goal,
-                                    walk_speed, distance_to_zone)
-    desired = act["move"] if detour is None else list(detour)
-    act["move"] = (move_with_route(o, me, desired, goal, route_key, enemies)
-                   if detour is None else desired)
+    desired = act["move"]
+    zone_travel = not inside and goal is not None and route_key == "zone" and MAP["ok"]
+    act["move"] = move_with_route(o, me, desired, goal, route_key, enemies,
+                                  zone_action=act if zone_travel else None)
     mobility(o, me, act, desired, want_up, fleeing, evade is not None,
-             jump_dodge, urgent and route_key == "zone")
+             jump_dodge, urgent and route_key == "zone", zone_travel=zone_travel)
     if enemies:
         fire_weapons(me, act, t, allow_fire=not (avoid and dist >= 40),
                      allow_charge=evade is None and not (fleeing or urgent or hit_now))
@@ -1477,7 +1503,7 @@ def main():
     CFG = hello.get("config", {})
     RNG = random.Random(hello.get("seed", 0))
     load_map(hello)
-    send({"type": "ready", "name": "mech-royale-v8m"})
+    send({"type": "ready", "name": "mech-royale-v8n"})
 
     while True:
         m = q.get()
