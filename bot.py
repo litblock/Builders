@@ -37,7 +37,8 @@ mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0,
        "strafe_side": 1, "strafe_until": 0.0}
 nav = {"side": 1, "until": 0.0, "last_pos": None, "stuck": 0, "last_t": -1.0}
 route = {"key": None, "goal": None, "waypoints": deque(), "retry": 0.0,
-         "best": math.inf, "progress": 0.0, "next_limit": 0.0}
+         "best": math.inf, "progress": 0.0, "next_limit": 0.0, "pressure": 0.0}
+target_lock = {"id": None, "time": -math.inf}
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
 # Upgrade ranking by id (higher = better), from the real hello.config.upgrades list.
@@ -268,14 +269,14 @@ def weapon_shot(me, weapon, target):
 
 
 def fire_weapons(me, act, target, allow_fire=True, allow_charge=True):
-    """Coordinate the shared torso aim and independent trigger for each slot."""
+    """Set the shared aim and independent triggers, returning the aim's value."""
     weapons = me["weapons"]
     current_aim = me["aim"]
     act["fire"] = [False, False]
     default_height = 4.5 if target.get("kind") == "mech" else 1.4
     act["aim"] = aim_toward(me, target["pos"], default_height)
     if not allow_fire:
-        return
+        return 0.0
 
     shots = []
     ready = []
@@ -299,27 +300,40 @@ def fire_weapons(me, act, target, allow_fire=True, allow_charge=True):
     charging = next((i for i in candidates if weapons[i].get("charge", 0) > 0), None)
     weights = {"gun": 1.0, "lightning": 1.5, "mortar": 2.6, "laser": 1.35}
 
-    def score(i):
-        shot = shots[i]
-        compatible = sum(weights[weapons[j]["kind"]] for j in candidates
-                         if aligned(shots[j], (shot.yaw, shot.pitch)))
-        slew = abs(wrap(shot.yaw - current_aim[0])) + abs(shot.pitch - current_aim[1])
-        # Use precise aim when lightning can share it with a narrow-angle weapon.
-        return compatible - 0.55 * slew + (0.08 if weapons[i]["kind"] != "lightning" else 0.0)
-
-    if charging is not None:
-        selected = charging
-    elif candidates:
-        selected = max(candidates, key=score)
-    else:
+    if not candidates:
         # Track a valid shot through reload or cooldown.
         shot = next((shot for shot in shots if shot), None)
         if shot:
             act["aim"] = [shot.yaw, shot.pitch]
-        return
+        return 0.25 if shot else 0.0
 
-    shot = shots[selected]
-    act["aim"] = [shot.yaw, shot.pitch]
+    aims = [(shots[i].yaw, shots[i].pitch) for i in candidates]
+    if len(candidates) == 2:
+        first, second = (shots[i] for i in candidates)
+        second_yaw = first.yaw + wrap(second.yaw - first.yaw)
+        yaw_min = max(first.yaw - first.yaw_limit * 0.9, second_yaw - second.yaw_limit * 0.9)
+        yaw_max = min(first.yaw + first.yaw_limit * 0.9, second_yaw + second.yaw_limit * 0.9)
+        pitch_min = max(first.pitch - first.pitch_limit * 0.9, second.pitch - second.pitch_limit * 0.9)
+        pitch_max = min(first.pitch + first.pitch_limit * 0.9, second.pitch + second.pitch_limit * 0.9)
+        if yaw_min <= yaw_max and pitch_min <= pitch_max:
+            if aligned(first, current_aim) and aligned(second, current_aim):
+                aims.append(tuple(current_aim))
+            else:
+                aims.append((wrap((yaw_min + yaw_max) / 2), (pitch_min + pitch_max) / 2))
+    if charging is not None:
+        aims = [aim for aim in aims if aligned(shots[charging], aim)]
+
+    compatible_now = {i for i in candidates if aligned(shots[i], current_aim)}
+
+    def score(aim):
+        compatible = sum(weights[weapons[i]["kind"]] * (1.20 if i in compatible_now else 1.0)
+                         for i in candidates if aligned(shots[i], aim))
+        slew = abs(wrap(aim[0] - current_aim[0])) + abs(aim[1] - current_aim[1])
+        return compatible - 0.55 * slew
+
+    aim = max(aims, key=score)
+    act["aim"] = list(aim)
+
     for i in candidates:
         shot = shots[i]
         if not aligned(shot, act["aim"]):
@@ -336,6 +350,37 @@ def fire_weapons(me, act, target, allow_fire=True, allow_charge=True):
                 act["fire"][i] = on_target and allow_charge
         else:
             act["fire"][i] = on_target
+    return score(aim)
+
+
+def combat_aim(o, me, act, nearest, enemies, allow_fire, allow_charge):
+    """Consider a small set of nearby targets and keep a usable aim stable."""
+    if not allow_fire:
+        fire_weapons(me, act, nearest, allow_fire=False)
+        return
+    px, py = me["pos"][:2]
+    now = o["t"]
+    deadline = time.perf_counter() + 0.006
+    last_id = target_lock["id"] if now - target_lock["time"] <= 0.6 else None
+    distance = math.dist((px, py), nearest["pos"][:2])
+    others = sorted((m for m in enemies if m is not nearest),
+                    key=lambda m: math.dist((px, py), m["pos"][:2]))
+    best_score = -math.inf
+    for enemy in (nearest, *others[:2]):
+        span = math.dist((px, py), enemy["pos"][:2])
+        if enemy is not nearest and (time.perf_counter() >= deadline or span > distance + 65.0):
+            break
+        plan = {}
+        value = fire_weapons(me, plan, enemy, allow_charge=allow_charge)
+        hp = enemy.get("hp")
+        finish = 0.25 if value >= 0.5 and hp is not None and hp <= 160 else 0.0
+        stable = 0.30 if value > 0 and enemy["id"] == last_id else 0.0
+        immediate = 0.65 if enemy is nearest and distance < 29 and value > 0 else 0.0
+        score = value + stable + finish + immediate - 0.012 * span
+        if score > best_score:
+            best_score, target, chosen = score, enemy, plan
+    target_lock.update(id=target["id"], time=now)
+    act.update(chosen)
 
 
 def reload_gun(me, act):
@@ -770,7 +815,30 @@ def contested_segment(start, end, enemies):
     return False
 
 
-def plan_route(start, goal, circles, enemies, partial):
+def zone_pressure(o, me):
+    """Weight route time more heavily as the available arrival margin shrinks."""
+    if not me["in_zone"]:
+        return 1.0
+    z = o["zone"]
+    distance = math.dist(me["pos"][:2], z["next_center"]) - z["next_radius"] + 5
+    if distance <= 0:
+        return 0.0
+    travel = distance / max(1.0, me["stats"].get("walk_speed", 11.7))
+    slack = z["shrink_end"] - o["t"] - travel
+    return max(0.0, min(1.0, (9.0 - slack) / 7.0))
+
+
+def route_cost(start, end, threats, risk_weight):
+    """Score distance in metres plus a penalty for passing close to mechs."""
+    length = math.dist(start, end)
+    separation = min((segment_separation(start, end, p) for p in threats),
+                     default=math.inf)
+    exposure = max(0.0, 48.0 - separation) / 48.0
+    collision = max(0.0, 8.0 - separation) / 8.0
+    return length * (1.0 + 2.0 * risk_weight * exposure ** 2 + 2.0 * collision ** 2)
+
+
+def plan_route(start, goal, circles, enemies, partial, risk_weight=1.0):
     """Bounded A* on a local grid anchored at the mech's current position."""
     deadline = time.perf_counter() + 0.012
     goal_distance = math.dist(start, goal)
@@ -778,7 +846,9 @@ def plan_route(start, goal, circles, enemies, partial):
     frontier = [(goal_distance, 0.0, (0, 0))]
     parents = {(0, 0): None}
     costs = {(0, 0): 0.0}
-    best, best_distance, reached = (0, 0), goal_distance, False
+    best, best_distance = (0, 0), goal_distance
+    best_finish = math.inf
+    finish = None
 
     def point(node):
         return start[0] + ROUTE_GRID * node[0], start[1] + ROUTE_GRID * node[1]
@@ -789,7 +859,9 @@ def plan_route(start, goal, circles, enemies, partial):
     for _ in range(320):
         if not frontier or time.perf_counter() >= deadline:
             break
-        _, cost, node = heapq.heappop(frontier)
+        estimate, cost, node = heapq.heappop(frontier)
+        if estimate >= best_finish:
+            break
         if cost != costs[node]:
             continue
         here = point(node)
@@ -798,8 +870,9 @@ def plan_route(start, goal, circles, enemies, partial):
             best, best_distance = node, remaining
         if (node != (0, 0) and remaining <= 9.0 and inside_limits(goal)
                 and walkable_segment(here, goal)):
-            best, reached = node, True
-            break
+            final_cost = cost + route_cost(here, goal, threats, risk_weight)
+            if final_cost < best_finish:
+                best_finish, finish = final_cost, node
         for ix, iy in ROUTE_NEIGHBORS:
             if time.perf_counter() >= deadline:
                 break
@@ -811,19 +884,19 @@ def plan_route(start, goal, circles, enemies, partial):
             new_cost = cost + step
             if new_cost >= costs.get(other, math.inf) or not inside_limits(there):
                 continue
-            separation = min((segment_separation(here, there, p) for p in threats),
-                             default=math.inf)
-            new_cost += step * max(0.0, 45.0 - separation) / 25.0
+            new_cost = cost + route_cost(here, there, threats, risk_weight)
             if new_cost >= costs.get(other, math.inf) or not walkable_segment(here, there):
                 continue
             costs[other] = new_cost
             parents[other] = node
-            estimate = new_cost + 1.2 * math.dist(there, goal)
+            estimate = new_cost + 1.1 * math.dist(there, goal)
             heapq.heappush(frontier, (estimate, new_cost, other))
 
-    if not reached and (not partial or goal_distance - best_distance < ROUTE_GRID):
+    if finish is not None:
+        best = finish
+    elif not partial or goal_distance - best_distance < ROUTE_GRID:
         return deque()
-    waypoints = deque([goal] if reached and math.dist(point(best), goal) > 0.5 else [])
+    waypoints = deque([goal] if finish is not None and math.dist(point(best), goal) > 0.5 else [])
     while parents[best] is not None:
         waypoints.appendleft(point(best))
         best = parents[best]
@@ -831,7 +904,7 @@ def plan_route(start, goal, circles, enemies, partial):
 
 
 def move_with_route(o, me, desired, goal, key, enemies):
-    """Follow cached waypoints when direct ground movement is blocked."""
+    """Compare ground approaches when a direct path is blocked or exposed."""
     speed = math.hypot(*desired)
     if goal is None or not MAP["ok"] or not me["grounded"] or speed < 0.1:
         return steer_around(o, me, desired)
@@ -842,6 +915,10 @@ def move_with_route(o, me, desired, goal, key, enemies):
     current_center = tuple(z["center"])
     key = (key, center, z["next_radius"])
     now = o["t"]
+    pressure = zone_pressure(o, me) if key[0] == "zone" else 0.0
+    risk_weight = 1.35 - 0.98 * pressure
+    nearby = [m for m in enemies if math.dist(start, m["pos"][:2]) < 115]
+    positions = [m["pos"][:2] for m in nearby]
     if route["key"] != key or math.dist(route["goal"], goal) > 9.0:
         route.update(key=key, goal=goal, waypoints=deque(), retry=now,
                      best=math.inf, progress=now)
@@ -854,6 +931,9 @@ def move_with_route(o, me, desired, goal, key, enemies):
     circles = ((current_center, max(z["radius"], current_distance)),
                (center, max(next_radius, next_distance + 2.0)))
     waypoints = route["waypoints"]
+    if waypoints and pressure >= 0.8 and route["pressure"] < 0.8:
+        waypoints.clear()
+        route["retry"] = now
     if waypoints and now - route["progress"] >= 2.0:
         waypoints.clear()
         route["retry"] = now + 0.8
@@ -862,13 +942,23 @@ def move_with_route(o, me, desired, goal, key, enemies):
         distance = math.dist(start, goal)
         look = min(16.0, distance)
         direct = start[0] + dx * look, start[1] + dy * look
-        if look > 2.0 and not walkable_segment(start, direct):
+        threatened = pressure < 0.75 and contested_segment(start, direct, nearby)
+        blocked = look > 2.0 and not walkable_segment(start, direct)
+        if blocked or threatened:
             if distance > ROUTE_HORIZON:
                 goal = (start[0] + dx * ROUTE_HORIZON, start[1] + dy * ROUTE_HORIZON)
-            waypoints = plan_route(start, goal, circles, enemies,
-                                   partial=key[0] == "zone" or distance > ROUTE_HORIZON)
+            waypoints = plan_route(start, goal, circles, nearby,
+                                   partial=key[0] == "zone" or distance > ROUTE_HORIZON,
+                                   risk_weight=risk_weight)
+            if threatened and not blocked and waypoints and math.dist(waypoints[-1], goal) < 1.0:
+                direct_cost = route_cost(start, goal, positions, risk_weight)
+                detour_cost = sum(route_cost(a, b, positions, risk_weight)
+                                  for a, b in zip((start, *waypoints), waypoints))
+                if detour_cost >= direct_cost and walkable_segment(start, goal):
+                    waypoints.clear()
             route.update(waypoints=waypoints, retry=now + 0.8,
-                         best=math.inf, progress=now, next_limit=circles[1][1])
+                         best=math.inf, progress=now, next_limit=circles[1][1],
+                         pressure=pressure)
     while waypoints and math.dist(start, waypoints[0]) < 1.7:
         waypoints.popleft()
         route.update(best=math.inf, progress=now)
@@ -879,13 +969,18 @@ def move_with_route(o, me, desired, goal, key, enemies):
         def usable(point):
             return (math.dist(point, center) <= next_limit
                     and math.dist(point, current_center) <= circles[0][1]
-                    and not contested_segment(start, point, enemies)
+                    and (pressure >= 0.9 or not contested_segment(start, point, nearby))
                     and walkable_segment(start, point, resolution=0.8))
 
         # Cut a corner only when the full shortcut has clearance.
         if len(waypoints) > 1 and math.dist(start, waypoints[1]) <= 14.0 and usable(waypoints[1]):
-            waypoints.popleft()
-            route.update(best=math.inf, progress=now)
+            first, second = waypoints[0], waypoints[1]
+            shortcut = route_cost(start, second, positions, risk_weight)
+            via_first = (route_cost(start, first, positions, risk_weight)
+                         + route_cost(first, second, positions, risk_weight))
+            if shortcut <= via_first + 0.5:
+                waypoints.popleft()
+                route.update(best=math.inf, progress=now)
         point = waypoints[0]
         if not usable(point):
             waypoints.clear()
@@ -1002,7 +1097,9 @@ def combat_move(o, me, target, enemies):
     if close_with_lightning:
         radial = max(-0.55, min(0.55, (distance - 0.72 * arc_range) / 20))
     else:
-        radial = -max(0.0, min(0.60, (40.0 - distance) / 27.0))
+        vulnerable = not alone or me["hp"] < 0.58 * me["max_hp"] or me["energy"] < 24
+        stand_off = 47.0 if vulnerable else 40.0
+        radial = -max(0.0, min(0.68, (stand_off - distance) / 27.0))
 
     center = o["zone"]["next_center"]
     limit = max(math.dist((px, py), center), 0.88 * o["zone"]["next_radius"])
@@ -1027,15 +1124,47 @@ def combat_move(o, me, target, enemies):
     return move
 
 
+def mortar_impact(projectile, start, velocity):
+    """Estimate a nearby shell's first impact within the next half second."""
+    x, y, z = projectile["pos"]
+    vx, vy, vz = projectile["vel"]
+    if math.dist(start[:2], (x, y)) > 58.0:
+        return None
+    stats = CFG.get("weapons", {}).get("mortar", {})
+    gravity = stats.get("gravity", 22.0)
+    radius = stats.get("splash_radius", 7.0) + 1.5
+    previous = x, y, z
+    for i in range(1, 9):
+        flight = i * 0.065
+        point = x + vx * flight, y + vy * flight, z + vz * flight - 0.5 * gravity * flight ** 2
+        landed = point[2] <= ground_z(point[0], point[1], start[2])
+        if MAP["ok"]:
+            landed = landed or inside_prism(*point) or los_blocked(previous, point)
+        if landed:
+            foot = tuple(start[j] + velocity[j] * flight for j in range(3))
+            if math.dist(point, foot) < radius and (not MAP["ok"] or
+                    not los_blocked(previous, (foot[0], foot[1], foot[2] + 2.0))):
+                return flight, point
+            return None
+        previous = point
+    return None
+
+
 def projectile_dodge(o, me):
-    """React to a near-term bullet intersection with the mech's cylinder."""
+    """React to near-term bullet intersections and mortar blasts."""
     px, py, pz = me["pos"]
     vx, vy, vz = me["vel"]
     body = me["stats"]
     radius = body.get("radius", 2.5) + 0.5
     height = body.get("height", 9.0)
     closest = None
+    shell = None
     for p in o.get("projectiles", ())[:48]:
+        if p.get("kind") == "mortar":
+            impact = mortar_impact(p, me["pos"], me["vel"])
+            if impact is not None and (shell is None or impact[0] < shell[0]):
+                shell = impact
+            continue
         if p.get("kind") not in ("gun", "npc"):
             continue
         x, y, z = p["pos"]
@@ -1057,14 +1186,24 @@ def projectile_dodge(o, me):
             continue
         if closest is None or t < closest[0]:
             closest = t, height_at_impact, ux, uy
-    if closest is None:
+    if closest is None and shell is None:
         return None, False
 
-    t, hit_height, ux, uy = closest
-    length = math.hypot(ux, uy)
-    side = -uy / length, ux / length
     center = o["zone"]["center"]
     limit = max(math.dist((px, py), center), o["zone"]["radius"])
+
+    if shell is not None and (closest is None or shell[0] <= closest[0]):
+        wx, wy = px + vx * shell[0] - shell[1][0], py + vy * shell[0] - shell[1][1]
+        angle = math.atan2(wy, wx)
+        options = [(math.cos(angle + off), math.sin(angle + off)) for off in (0, -0.85, 0.85)]
+        jump = False
+    else:
+        t, hit_height, ux, uy = closest
+        length = math.hypot(ux, uy)
+        side = -uy / length, ux / length
+        options = [side, (-side[0], -side[1])]
+        rise = body.get("jump_speed", 11.0) * (t - 0.05) - 11.0 * (t - 0.05) ** 2
+        jump = hit_height + 0.45 < rise
 
     def score(direction):
         dx, dy = direction
@@ -1072,10 +1211,7 @@ def projectile_dodge(o, me):
         room = not MAP["ok"] or walkable_segment((px, py), end)
         return 5 * room - 2 * max(0, math.dist(end, center) - limit) + 0.1 * (vx * dx + vy * dy)
 
-    movement = max((side, (-side[0], -side[1])), key=score)
-    rise = body.get("jump_speed", 11.0) * (t - 0.05) - 11.0 * (t - 0.05) ** 2
-    jump = hit_height + 0.45 < rise
-    return movement, jump
+    return max(options, key=score), jump
 
 
 def air_clear(me, x, y, feet):
@@ -1091,7 +1227,8 @@ def air_clear(me, x, y, feet):
     return True
 
 
-def mobility(o, me, act, desired, want_up, fleeing, evading, jump_dodge, urgent):
+def mobility(o, me, act, desired, want_up, fleeing, evading, jump_dodge, urgent,
+             threat_distance=math.inf):
     """Use energy for short sprints or intentional climbs."""
     now = o["t"]
     px, py, pz = me["pos"]
@@ -1133,10 +1270,14 @@ def mobility(o, me, act, desired, want_up, fleeing, evading, jump_dodge, urgent)
                 mob.update(blocked=0, jump_cd=now + 1.3,
                            climb_until=now + 0.65 if climb and not low_ledge else now)
 
-    reserve = 31 if evading or urgent else 49
-    sprint = (evading or urgent or fleeing) and energy >= reserve and planned_speed > 0.55
+    reserve = 28 if urgent and me["hp"] < 0.5 * me["max_hp"] else 32
+    if not (evading or urgent):
+        reserve = 42 if threat_distance <= 45 else 54
+    retreat_sprint = fleeing and threat_distance <= 95
+    sprint = (evading or urgent or retreat_sprint) and energy >= reserve and planned_speed > 0.55
     if sprint and now >= mob["sprint_ready"]:
-        mob.update(sprint_until=now + 0.46, sprint_ready=now + 0.9)
+        duration = 0.55 if urgent else 0.42
+        mob.update(sprint_until=now + duration, sprint_ready=now + 0.88)
     if sprint and now < mob["sprint_until"] and not act.get("jump"):
         act["boost"] = True
 
@@ -1158,10 +1299,8 @@ def safe_zone_route(o, me, enemies, cx, cy, radius):
     nearby = [m for m in enemies if math.hypot(m["pos"][0]-px, m["pos"][1]-py) < 115]
     if not nearby:
         return [ux, uy]
-    z = o["zone"]
-    # If already taking zone damage, prioritize the fastest route to safety.
-    urgent = not me.get("in_zone", True) or o["t"] >= z.get("shrink_start", 1e9)
-    max_turn = 0.42 if urgent else 0.85
+    pressure = zone_pressure(o, me)
+    max_turn = 0.85 - 0.43 * pressure
     look = min(32.0, max(12.0, gd * 0.3))
     best, best_dir = -1e20, [ux, uy]
     for turn in (-max_turn, -max_turn/2, 0, max_turn/2, max_turn):
@@ -1183,7 +1322,7 @@ def safe_zone_route(o, me, enemies, cx, cy, radius):
             if along > 0 and math.hypot(rx,ry) < 60:
                 danger += max(0, (60-math.hypot(rx,ry))/60) * 0.6
         progress = (gx*vx + gy*vy) / gd
-        score = (5.0 if urgent else 2.8)*progress - danger
+        score = (2.8 + 2.2 * pressure) * progress - danger
         if score > best:
             best, best_dir = score, [vx, vy]
     return best_dir
@@ -1221,16 +1360,14 @@ def decide(o):
     dv = laser_dodge(o, me, enemies)
     bullet_move, jump_dodge = projectile_dodge(o, me) if dv is None else (None, False)
     evade = dv if dv is not None else bullet_move
-    walk_speed = max(1.0, me["stats"].get("walk_speed", 11.7))
-    distance_to_zone = max(0.0, zd - z["next_radius"] + 5.0)
-    urgent = (not me["in_zone"] or
-              (distance_to_zone > 0 and now >= z["shrink_start"]
-               and distance_to_zone / walk_speed + 2.0 > z["shrink_end"] - now))
+    urgent = zone_pressure(o, me) >= 0.99
+    threat_distance = math.inf
 
     if enemies:
         t = min(enemies, key=lambda m: math.hypot(m["pos"][0] - px, m["pos"][1] - py))
         dx, dy = t["pos"][0] - px, t["pos"][1] - py
         dist = math.hypot(dx, dy) or 1.0
+        threat_distance = dist
 
         # Baseline V1 survival thresholds retained; do not repeat V2's broad retreat policy.
         # Distant enemies should not prevent safe farming and collecting upgrades.
@@ -1306,6 +1443,7 @@ def decide(o):
             # lost sight of a threat: go to cover (or keep running from where it was)
             fleeing = True
             gx, gy = flee_mem["from"]
+            threat_distance = math.hypot(px - gx, py - gy)
             rv = retreat_vec(o, me, [(gx, gy, ground_z(gx, gy, pz) + 8)], cx, cy, z["next_radius"])
             if rv is None:
                 fx, fy = px - gx, py - gy
@@ -1347,10 +1485,10 @@ def decide(o):
     desired = act["move"]
     act["move"] = move_with_route(o, me, desired, goal, route_key, enemies)
     mobility(o, me, act, desired, want_up, fleeing, evade is not None,
-             jump_dodge, urgent and route_key == "zone")
+             jump_dodge, urgent and route_key == "zone", threat_distance)
     if enemies:
-        fire_weapons(me, act, t, allow_fire=not (avoid and dist >= 40),
-                     allow_charge=evade is None and not (fleeing or urgent or hit_now))
+        combat_aim(o, me, act, t, enemies, allow_fire=not (avoid and dist >= 40),
+                   allow_charge=evade is None and not (fleeing or urgent or hit_now))
     reload_gun(me, act)
 
     return act
@@ -1365,7 +1503,7 @@ def main():
     CFG = hello.get("config", {})
     RNG = random.Random(hello.get("seed", 0))
     load_map(hello)
-    send({"type": "ready", "name": "mech-royale-v8g"})
+    send({"type": "ready", "name": "mech-royale-v8h"})
 
     while True:
         m = q.get()
