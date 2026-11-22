@@ -1,3 +1,4 @@
+import heapq
 import json
 import math
 import os
@@ -7,12 +8,9 @@ import sys
 import threading
 import time
 from array import array
+from collections import deque
 
 q = queue.Queue()
-
-# Offline debugging only: set MECH_LOG=log.jsonl when running check.py.
-# Unset in real matches, so nothing is opened on the read-only disk.
-LOG = open(os.environ["MECH_LOG"], "a") if os.environ.get("MECH_LOG") else None
 
 CFG = {}
 RNG = random.Random(0)
@@ -20,7 +18,7 @@ RNG = random.Random(0)
 known = {}       # weapon pickup id -> pickup dict (remembered after it leaves view)
 known_cubes = {}  # cube id -> {"c": cube dict, "t": last seen match time}
 ignore = {}      # (type, id) -> match time until which we skip that target
-chase = {"key": None, "best": 1e9, "t": 0.0, "start": 0.0, "tz": None}
+chase = {"key": None, "best": 1e9, "t": 0.0, "start": 0.0, "tz": None, "goal": None}
 wander = {"pt": None, "until": 0.0}
 
 EARLY_S = 120     # "early game": avoid fights against healthier enemies before this match time
@@ -36,6 +34,8 @@ dodge = {"until": 0.0, "side": 1}
 MAP = {"ok": False}
 mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0}
 nav = {"side": 1, "until": 0.0, "last_pos": None, "stuck": 0, "last_t": -1.0}
+route = {"key": None, "goal": None, "waypoints": deque(), "retry": 0.0,
+         "best": math.inf, "progress": 0.0, "next_limit": 0.0}
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
 # Upgrade ranking by id (higher = better), from the real hello.config.upgrades list.
@@ -187,6 +187,7 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
     px, py, pz = me["pos"]
     now = o["t"]
     chase["tz"] = None
+    chase["goal"] = None
     need_weapon = me["weapons"][1] is None
     safe_r = 0.92 * z["next_radius"]
 
@@ -268,17 +269,23 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
         dx, dy = tpos[0] - px, tpos[1] - py
         d = math.hypot(dx, dy) or 1.0
 
-        # stuck / timeout detection (no pathfinding yet)
+        # A detour can temporarily increase the straight-line distance.
+        following_route = (route["key"] == (key, tuple(z["next_center"]), z["next_radius"])
+                           and route["waypoints"] and now - route["progress"] < 2.0)
         if chase["key"] != key:
             chase.update(key=key, best=d, t=now, start=now)
         elif d < chase["best"] - 1.5:
             chase.update(best=d, t=now)
-        elif d > standoff + 5 and now - chase["t"] > 3.0:
-            ignore[key] = now + 30
-            chase["key"] = None
-        if kind in ("npc", "crate") and now - chase["start"] > 18.0:
-            ignore[key] = now + 40
-            chase["key"] = None
+        elif following_route:
+            chase["t"] = now
+        timed_out = kind in ("npc", "crate") and now - chase["start"] > 18.0
+        stalled = now - chase["t"] > 3.0 and (d > standoff + 5 or kind in ("cube", "pickup"))
+        if timed_out or stalled:
+            ignore[key] = now + (40 if timed_out else 30)
+            chase.update(key=None, tz=None)
+            return False
+
+        chase["goal"] = tuple(tpos[:2])
 
         if kind == "pickup":
             if d < 3.0:
@@ -296,15 +303,19 @@ def loot(o, me, act, held, z, cx, cy, enemies_none=True):
         zoff = 1.6 if kind == "npc" else 1.2
         tv = tgt.get("vel", [0, 0, 0])
         yaw, pitch = aim_at(me, tpos, tv, speed, zoff)
+        clear = not MAP["ok"] or path_clear(px, py, tpos[0], tpos[1], max_len=120)
+        if d <= standoff and not clear and now - chase["t"] > 3.0:
+            ignore[key] = now + 30
+            chase.update(key=None, tz=None, goal=None)
+            return False
         act["aim"] = [yaw, pitch]
         yaw_ok = abs(wrap(yaw - me["aim"][0])) < 0.075
         pitch_ok = abs(pitch - me["aim"][1]) < 0.085
-        clear = path_clear(px, py, tpos[0], tpos[1], max_len=120)
         act["fire"] = [bool(gun and gun.get("reload", 0) <= 0 and
                             gun.get("ammo", 0) > 0 and yaw_ok and pitch_ok and
                             d < 115 and clear), False]
         # Don't run into targets; advance until within accurate gun range.
-        act["move"] = [dx / d, dy / d] if d > standoff else [0, 0]
+        act["move"] = [dx / d, dy / d] if d > standoff or not clear else [0, 0]
         return True
 
     # nothing to go for: look for a second weapon by wandering inside the zone
@@ -380,7 +391,6 @@ def load_map(hello):
                     grid.setdefault((gx, gy), []).append(idx)
         MAP.update(ok=True, arr=arr, nx=nx, ny=ny, minX=float(t["minX"]), minY=float(t["minY"]),
                    step=float(t.get("step", 1.0)), prisms=prisms, grid=grid)
-        print("map loaded: %d prisms, terrain %dx%d" % (len(prisms), nx, ny), file=sys.stderr)
     except Exception as e:
         MAP["ok"] = False
         print("map NOT loaded (retreat uses plain flee):", repr(e), file=sys.stderr)
@@ -532,6 +542,146 @@ def steer_around(o, me, desired):
         nav["side"] = 1 if best[3] > 0 else -1
         nav["until"] = now + 2.0
     return [best[1] * mag, best[2] * mag]
+
+
+ROUTE_GRID = 6.0
+ROUTE_HORIZON = 72.0
+ROUTE_NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1),
+                   (1, 1), (1, -1), (-1, 1), (-1, -1))
+
+
+def walkable_segment(start, end):
+    """Sample the mech's footprint along a ground route."""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    steps = max(1, math.ceil(math.hypot(dx, dy) / 2.0))
+    height = ground(*start)
+    for i in range(1, steps + 1):
+        x, y = start[0] + dx * i / steps, start[1] + dy * i / steps
+        if not nav_passable(x, y, height):
+            return False
+        height = ground(x, y)
+    return True
+
+
+def plan_route(start, goal, circles, enemies, partial):
+    """Bounded A* on a local grid anchored at the mech's current position."""
+    deadline = time.perf_counter() + 0.012
+    goal_distance = math.dist(start, goal)
+    threats = [tuple(m["pos"][:2]) for m in enemies if math.dist(start, m["pos"][:2]) < 135]
+    frontier = [(goal_distance, 0.0, (0, 0))]
+    parents = {(0, 0): None}
+    costs = {(0, 0): 0.0}
+    best, best_distance, reached = (0, 0), goal_distance, False
+
+    def point(node):
+        return start[0] + ROUTE_GRID * node[0], start[1] + ROUTE_GRID * node[1]
+
+    def inside_limits(p):
+        return all(math.dist(p, center) <= radius for center, radius in circles)
+
+    for _ in range(320):
+        if not frontier or time.perf_counter() >= deadline:
+            break
+        _, cost, node = heapq.heappop(frontier)
+        if cost != costs[node]:
+            continue
+        here = point(node)
+        remaining = math.dist(here, goal)
+        if remaining < best_distance:
+            best, best_distance = node, remaining
+        if (node != (0, 0) and remaining <= 9.0 and inside_limits(goal)
+                and walkable_segment(here, goal)):
+            best, reached = node, True
+            break
+        for ix, iy in ROUTE_NEIGHBORS:
+            if time.perf_counter() >= deadline:
+                break
+            other = node[0] + ix, node[1] + iy
+            if max(abs(other[0]), abs(other[1])) > 16:
+                continue
+            there = point(other)
+            step = ROUTE_GRID * math.hypot(ix, iy)
+            new_cost = cost + step
+            if new_cost >= costs.get(other, math.inf) or not inside_limits(there):
+                continue
+            separation = min((math.dist(there, p) for p in threats), default=math.inf)
+            new_cost += step * max(0.0, 45.0 - separation) / 25.0
+            if new_cost >= costs.get(other, math.inf) or not walkable_segment(here, there):
+                continue
+            costs[other] = new_cost
+            parents[other] = node
+            estimate = new_cost + 1.2 * math.dist(there, goal)
+            heapq.heappush(frontier, (estimate, new_cost, other))
+
+    if not reached and (not partial or goal_distance - best_distance < ROUTE_GRID):
+        return deque()
+    waypoints = deque([goal] if reached and math.dist(point(best), goal) > 0.5 else [])
+    while parents[best] is not None:
+        waypoints.appendleft(point(best))
+        best = parents[best]
+    return waypoints
+
+
+def move_with_route(o, me, desired, goal, key, enemies):
+    """Follow cached waypoints when direct ground movement is blocked."""
+    speed = math.hypot(*desired)
+    if goal is None or not MAP["ok"] or not me["grounded"] or speed < 0.1:
+        return steer_around(o, me, desired)
+
+    start = tuple(me["pos"][:2])
+    z = o["zone"]
+    center = tuple(z["next_center"])
+    current_center = tuple(z["center"])
+    key = (key, center, z["next_radius"])
+    now = o["t"]
+    if route["key"] != key or math.dist(route["goal"], goal) > 9.0:
+        route.update(key=key, goal=goal, waypoints=deque(), retry=now,
+                     best=math.inf, progress=now)
+
+    # A route may skirt the next circle's boundary, but it must stay in the
+    # current circle or avoid taking the mech farther outside it.
+    current_distance = math.dist(start, current_center)
+    next_distance = math.dist(start, center)
+    next_radius = z["next_radius"]
+    circles = ((current_center, max(z["radius"], current_distance)),
+               (center, max(next_radius, next_distance + 2.0)))
+    waypoints = route["waypoints"]
+    if waypoints and now - route["progress"] >= 2.0:
+        waypoints.clear()
+        route["retry"] = now + 0.8
+    if not waypoints and now >= route["retry"]:
+        dx, dy = (component / speed for component in desired)
+        distance = math.dist(start, goal)
+        look = min(16.0, distance)
+        direct = start[0] + dx * look, start[1] + dy * look
+        if look > 2.0 and not walkable_segment(start, direct):
+            if distance > ROUTE_HORIZON:
+                goal = (start[0] + dx * ROUTE_HORIZON, start[1] + dy * ROUTE_HORIZON)
+            waypoints = plan_route(start, goal, circles, enemies,
+                                   partial=key[0] == "zone" or distance > ROUTE_HORIZON)
+            route.update(waypoints=waypoints, retry=now + 0.8,
+                         best=math.inf, progress=now, next_limit=circles[1][1])
+    while waypoints and math.dist(start, waypoints[0]) < 1.7:
+        waypoints.popleft()
+        route.update(best=math.inf, progress=now)
+    if waypoints:
+        point = waypoints[0]
+        contested = any(math.dist(point, m["pos"][:2]) < 20.0
+                        and math.dist(point, m["pos"][:2]) + 3.0 < math.dist(start, m["pos"][:2])
+                        for m in enemies)
+        # Keep the detour's original limit until we enter the next circle.
+        next_limit = next_radius if next_distance <= next_radius else route["next_limit"]
+        if (contested or math.dist(point, center) > next_limit
+                or math.dist(point, current_center) > circles[0][1]
+                or not walkable_segment(start, point)):
+            waypoints.clear()
+            route["retry"] = now + 0.8
+        else:
+            distance = math.dist(start, point)
+            if distance < route["best"] - 1.0:
+                route.update(best=distance, progress=now)
+            return [(point[i] - start[i]) * speed / distance for i in range(2)]
+    return steer_around(o, me, desired)
 
 
 def plan_cover(o, me, threats, cx, cy, nr, force=False):
@@ -716,6 +866,8 @@ def decide(o):
     # --- zone: head for the next circle, stop once well inside it ---
     z = o["zone"]
     cx, cy = z["next_center"]
+    goal = (cx, cy)
+    route_key = "zone"
     zd = math.hypot(cx - px, cy - py) or 1.0
     inside = me["in_zone"] and zd < 0.85 * z["next_radius"]
     if (not inside) or zd > 0.5 * z["next_radius"]:
@@ -729,6 +881,7 @@ def decide(o):
     firing_gun = False
 
     if enemies:
+        dv = laser_dodge(o, me, enemies)
         t = min(enemies, key=lambda m: math.hypot(m["pos"][0] - px, m["pos"][1] - py))
         dx, dy = t["pos"][0] - px, t["pos"][1] - py
         dist = math.hypot(dx, dy) or 1.0
@@ -737,9 +890,10 @@ def decide(o):
 
         # Baseline V1 survival thresholds retained; do not repeat V2's broad retreat policy.
         # Distant enemies should not prevent safe farming and collecting upgrades.
-        if inside and dist > 75 and not hit_now and now < 180:
+        if inside and dist > 75 and not hit_now and dv is None and now < 180:
             if loot(o, me, act, held, z, cx, cy):
-                act["move"] = steer_around(o, me, act.get("move", [0, 0]))
+                act["move"] = move_with_route(o, me, act["move"], chase["goal"],
+                                              chase["key"], enemies)
                 mobility(o, me, act, chase["tz"] is not None and chase["tz"] - pz > 1.0,
                          False, hit_now)
                 if gun and gun["reload"] == 0 and gun["ammo"] == 0:
@@ -784,38 +938,10 @@ def decide(o):
             fire0 = fire1 = False
         act["fire"] = [fire0, fire1]
 
-        # V8E: avoid being surrounded. Only disengage from multiple nearby mechs,
-        # or when already weakened; keep the V8D one-on-one behavior intact.
-        nearby_threats = [m for m in enemies
-                          if math.hypot(m["pos"][0] - px, m["pos"][1] - py) < 95]
-        surrounded = (len(nearby_threats) >= 3 or
-                      (len(nearby_threats) >= 2 and me["hp"] < 0.75 * me["max_hp"]))
-
         # strafe, close in with lightning, or back off when low on HP
         if inside:
-            if surrounded and not avoid:
-                fleeing = True
-                flee_mem["until"] = now + FLEE_KEEP_S
-                nearest = min(nearby_threats, key=lambda m:
-                              math.hypot(m["pos"][0] - px, m["pos"][1] - py))
-                flee_mem["from"] = tuple(nearest["pos"][:2])
-                tl = [(m["pos"][0], m["pos"][1],
-                       m["pos"][2] + 8 * (1 + 0.05 * m.get("cubes", 0)))
-                      for m in nearby_threats]
-                rv = retreat_vec(o, me, tl, cx, cy, z["next_radius"])
-                if rv is not None:
-                    cover["hold_until"] = now + HEAL_HOLD_S
-                    act["move"] = rv
-                else:
-                    # Run away from the combined enemy positions, not just one mech.
-                    fx = sum(px - m["pos"][0] for m in nearby_threats)
-                    fy = sum(py - m["pos"][1] for m in nearby_threats)
-                    if zd > 0.6 * z["next_radius"]:
-                        fx += 0.8 * (cx - px) / zd * len(nearby_threats) * 35
-                        fy += 0.8 * (cy - py) / zd * len(nearby_threats) * 35
-                    fn = math.hypot(fx, fy) or 1.0
-                    act["move"] = [fx / fn, fy / fn]
-            elif avoid:
+            goal = None
+            if avoid:
                 fleeing = True
                 tt = min(threats, key=lambda m: math.hypot(m["pos"][0] - px, m["pos"][1] - py))
                 flee_mem["until"] = now + FLEE_KEEP_S
@@ -862,11 +988,13 @@ def decide(o):
                     act["move"] = [mx / n, my / n]
                 else:
                     act["move"] = [sx, sy]
-        dv = laser_dodge(o, me, enemies)
         if dv is not None:                  # a charging laser is lined up on us: sprint sideways
+            goal = None
             act["move"] = dv
             if me["energy"] > 25:
                 act["boost"] = True
+        elif not inside:
+            act["move"] = safe_zone_route(o, me, enemies, cx, cy, z["next_radius"])
     else:
         # shot by a mech we cannot see: treat the bearing as a threat and take cover
         if inside:
@@ -879,6 +1007,7 @@ def decide(o):
                     cover["plan_t"] = -99.0               # force a fresh plan
                     cover["hold_until"] = now + HEAL_HOLD_S
         if inside and flee_mem["from"] is not None and now < flee_mem["until"]:
+            goal = None
             # lost sight of a threat: go to cover (or keep running from where it was)
             fleeing = True
             gx, gy = flee_mem["from"]
@@ -897,6 +1026,7 @@ def decide(o):
             acted = True
         elif (inside and cover["pt"] is not None and now < cover["hold_until"]
               and me["hp"] < 0.9 * me["max_hp"]):
+            goal = None
             # heal in cover: walk to the spot and wait there (regen needs ~5 s without damage)
             ddx, ddy = cover["pt"][0] - px, cover["pt"][1] - py
             dd = math.hypot(ddx, ddy)
@@ -905,6 +1035,8 @@ def decide(o):
         else:
             acted = loot(o, me, act, held, z, cx, cy) if inside else False
             want_up = acted and chase["tz"] is not None and chase["tz"] - pz > 1.0
+            if acted:
+                goal, route_key = chase["goal"], chase["key"]
         if "fire" in act:
             firing_gun = act["fire"][0]
         if not acted:
@@ -914,13 +1046,7 @@ def decide(o):
             if hits:
                 act["aim"] = [hits[-1]["bearing"], 0]
 
-    # V8D: when travelling to the next circle, avoid visible enemy mechs.
-    # Preserve combat/laser dodge and any deliberate looting while safely inside.
-    if not inside and enemies and not fleeing:
-        act["move"] = safe_zone_route(o, me, enemies, cx, cy, z["next_radius"])
-    # Apply obstacle avoidance to zone travel, loot chasing, combat and retreat.
-    # Do not override intentional stationary actions (healing or shooting from cover).
-    act["move"] = steer_around(o, me, act.get("move", [0, 0]))
+    act["move"] = move_with_route(o, me, act["move"], goal, route_key, enemies)
     mobility(o, me, act, want_up, fleeing, hit_now)
 
     # reload when empty, or when idle and under half a magazine
@@ -940,10 +1066,7 @@ def main():
     CFG = hello.get("config", {})
     RNG = random.Random(hello.get("seed", 0))
     load_map(hello)
-    if LOG:
-        LOG.write(json.dumps({"hello": hello, "map_ok": MAP["ok"]}) + "\n")
-        LOG.flush()
-    send({"type": "ready", "name": "simple-bot"})
+    send({"type": "ready", "name": "mech-royale-v8f"})
 
     while True:
         m = q.get()
@@ -965,9 +1088,6 @@ def main():
                 print("error:", repr(e), file=sys.stderr)
                 act = {"tick": m["tick"]}
             send(act)
-            if LOG:
-                LOG.write(json.dumps({"obs": m, "act": act}) + "\n")
-                LOG.flush()
 
 
 if __name__ == "__main__":
