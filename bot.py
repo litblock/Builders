@@ -38,10 +38,6 @@ mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0,
 nav = {"side": 1, "until": 0.0, "last_pos": None, "stuck": 0, "last_t": -1.0}
 route = {"key": None, "goal": None, "waypoints": deque(), "retry": 0.0,
          "best": math.inf, "progress": 0.0, "next_limit": 0.0}
-weapon_sounds = deque(maxlen=10)
-SOUND_MEMORY = 0.9
-SOUND_STRENGTH = {"gun": 0.65, "mortar": 0.9, "laser": 1.0,
-                  "laser_charge": 1.0, "lightning": 0.9}
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
 # Upgrade ranking by id (higher = better), from the real hello.config.upgrades list.
@@ -1193,90 +1189,24 @@ def safe_zone_route(o, me, enemies, cx, cy, radius):
     return best_dir
 
 
-def remember_weapon_sounds(o, me, enemies):
-    """Keep recent nearby weapon bearings that vision does not already explain."""
-    now = o["t"]
-    reports = [s for s in o.get("sounds", ())
-               if s["dist"] == "near" and s["kind"] in SOUND_STRENGTH and s["age"] <= 0.25]
-    if not reports and not weapon_sounds:
+def take_nearby_weapon(o, me, act, held):
+    """Add a pickup command for an in-range weapon while entering the zone."""
+    if held[1] is not None or "take" in act:
         return
-    px, py = me["pos"][:2]
-    settings = CFG.get("sound", {})
-    near_range = settings.get("near", 60)
-    tolerance = math.radians(2 * settings.get("bearing_noise_deg", 7) + 4)
-    known_bearings = [math.atan2(m["pos"][1] - py, m["pos"][0] - px) for m in enemies
-                      if math.dist((px, py), m["pos"][:2]) <= near_range + 8]
-
-    def matches_observed(bearing):
-        return any(abs(wrap(bearing - known)) <= tolerance for known in known_bearings)
-
-    if weapon_sounds:
-        pending = [cue for cue in weapon_sounds
-                   if now - cue[0] <= SOUND_MEMORY and not matches_observed(cue[1])]
-        weapon_sounds.clear()
-        weapon_sounds.extend(pending)
-    for sound in reports:
-        bearing = sound["bearing"]
-        heard = now - sound["age"]
-        if matches_observed(bearing):
+    pickup_range = CFG.get("loot", {}).get("pickup_radius", 4.0)
+    px, py, pz = me["pos"]
+    best = None
+    for pickup in o.get("pickups", ()):
+        if pickup["kind"] in held or ignore.get(("p", pickup["id"]), 0) > o["t"]:
             continue
-        if any(abs(heard - t) < 0.025 and abs(wrap(bearing - angle)) < 0.2 and kind == sound["kind"]
-               for t, angle, kind in weapon_sounds):
-            continue
-        weapon_sounds.append((heard, bearing, sound["kind"]))
-
-
-def sound_zone_heading(o, me, desired):
-    """Bias a clear zone route around a sector with recent weapons fire."""
-    speed = math.hypot(*desired)
-    if speed < 0.1 or not MAP["ok"] or not me["grounded"] or route["waypoints"]:
-        return desired
-    now = o["t"]
-    base = math.atan2(desired[1], desired[0])
-    recent = [(t, angle, kind) for t, angle, kind in weapon_sounds
-              if 0 <= now - t <= SOUND_MEMORY]
-    cues = []
-    for heard, bearing, kind in recent:
-        if abs(wrap(bearing - base)) > 0.7:
-            continue
-        if kind == "gun" and not any(
-                abs(t - heard) >= 0.12 and abs(wrap(angle - bearing)) < 0.28
-                for t, angle, _ in recent):
-            continue
-        cues.append((bearing, SOUND_STRENGTH[kind] * (1.0 - (now - heard) / SOUND_MEMORY)))
-    if not cues:
-        return desired
-
-    zone = o["zone"]
-    current_center = zone["center"]
-    target_center = zone["next_center"]
-    px, py = start = tuple(me["pos"][:2])
-    distance = math.dist(start, target_center)
-    look = min(16.0, distance)
-    if look < 4.0:
-        return desired
-    dx, dy = desired[0] / speed, desired[1] / speed
-    if not walkable_segment(start, (px + look * dx, py + look * dy)):
-        return desired
-
-    def danger(angle):
-        # This is a directional penalty. The game only gives a range band.
-        return max(strength * max(0.0, 1.0 - abs(wrap(angle - bearing)) / 0.85) ** 2
-                   for bearing, strength in cues)
-
-    best_score = 2.8 - danger(base)
-    best = desired
-    for offset in (-0.20, 0.20, -0.42, 0.42):
-        angle = base + offset
-        ux, uy = math.cos(angle), math.sin(angle)
-        end = px + look * ux, py + look * uy
-        if (math.dist(end, current_center) > zone["radius"] or
-                distance - math.dist(end, target_center) < 0.7 * look):
-            continue
-        score = 2.8 * math.cos(offset) - danger(angle)
-        if score > best_score + 0.025 and walkable_segment(start, end):
-            best_score, best = score, [ux * speed, uy * speed]
-    return best
+        x, y, z = pickup["pos"]
+        distance = math.hypot(x - px, y - py)
+        if distance <= pickup_range and abs(z - pz) <= 4.0:
+            candidate = distance, WEAPON_RANK.get(pickup["kind"], 3), pickup["id"]
+            if best is None or candidate < best:
+                best = candidate
+    if best is not None:
+        act["take"] = best[2]
 
 
 def decide(o):
@@ -1308,7 +1238,6 @@ def decide(o):
         act["move"] = [0, 0]
 
     enemies = [m for m in o["mechs"] if m["kind"] == "mech" and m["id"] != me["id"]]
-    remember_weapon_sounds(o, me, enemies)
     dv = laser_dodge(o, me, enemies)
     bullet_move, jump_dodge = projectile_dodge(o, me) if dv is None else (None, False)
     evade = dv if dv is not None else bullet_move
@@ -1436,9 +1365,6 @@ def decide(o):
         act["move"] = evade
         goal = None
     desired = act["move"]
-    zone_slack = z["shrink_end"] - now - distance_to_zone / walk_speed
-    if route_key == "zone" and not inside and not urgent and not hit_now and evade is None and zone_slack > 6.0:
-        desired = sound_zone_heading(o, me, desired)
     act["move"] = move_with_route(o, me, desired, goal, route_key, enemies)
     mobility(o, me, act, desired, want_up, fleeing, evade is not None,
              jump_dodge, urgent and route_key == "zone")
@@ -1446,6 +1372,8 @@ def decide(o):
         fire_weapons(me, act, t, allow_fire=not (avoid and dist >= 40),
                      allow_charge=evade is None and not (fleeing or urgent or hit_now))
     reload_gun(me, act)
+    if route_key == "zone" and not inside:
+        take_nearby_weapon(o, me, act, held)
 
     return act
 
@@ -1459,7 +1387,7 @@ def main():
     CFG = hello.get("config", {})
     RNG = random.Random(hello.get("seed", 0))
     load_map(hello)
-    send({"type": "ready", "name": "mech-royale-v8k"})
+    send({"type": "ready", "name": "mech-royale-v8l"})
 
     while True:
         m = q.get()
