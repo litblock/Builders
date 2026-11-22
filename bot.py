@@ -784,9 +784,38 @@ def decide(o):
             fire0 = fire1 = False
         act["fire"] = [fire0, fire1]
 
+        # V8E: avoid being surrounded. Only disengage from multiple nearby mechs,
+        # or when already weakened; keep the V8D one-on-one behavior intact.
+        nearby_threats = [m for m in enemies
+                          if math.hypot(m["pos"][0] - px, m["pos"][1] - py) < 95]
+        surrounded = (len(nearby_threats) >= 3 or
+                      (len(nearby_threats) >= 2 and me["hp"] < 0.75 * me["max_hp"]))
+
         # strafe, close in with lightning, or back off when low on HP
         if inside:
-            if avoid:
+            if surrounded and not avoid:
+                fleeing = True
+                flee_mem["until"] = now + FLEE_KEEP_S
+                nearest = min(nearby_threats, key=lambda m:
+                              math.hypot(m["pos"][0] - px, m["pos"][1] - py))
+                flee_mem["from"] = tuple(nearest["pos"][:2])
+                tl = [(m["pos"][0], m["pos"][1],
+                       m["pos"][2] + 8 * (1 + 0.05 * m.get("cubes", 0)))
+                      for m in nearby_threats]
+                rv = retreat_vec(o, me, tl, cx, cy, z["next_radius"])
+                if rv is not None:
+                    cover["hold_until"] = now + HEAL_HOLD_S
+                    act["move"] = rv
+                else:
+                    # Run away from the combined enemy positions, not just one mech.
+                    fx = sum(px - m["pos"][0] for m in nearby_threats)
+                    fy = sum(py - m["pos"][1] for m in nearby_threats)
+                    if zd > 0.6 * z["next_radius"]:
+                        fx += 0.8 * (cx - px) / zd * len(nearby_threats) * 35
+                        fy += 0.8 * (cy - py) / zd * len(nearby_threats) * 35
+                    fn = math.hypot(fx, fy) or 1.0
+                    act["move"] = [fx / fn, fy / fn]
+            elif avoid:
                 fleeing = True
                 tt = min(threats, key=lambda m: math.hypot(m["pos"][0] - px, m["pos"][1] - py))
                 flee_mem["until"] = now + FLEE_KEEP_S
