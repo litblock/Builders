@@ -38,6 +38,9 @@ mob = {"blocked": 0, "jump_cd": 0.0, "climb_until": 0.0,
 nav = {"side": 1, "until": 0.0, "last_pos": None, "stuck": 0, "last_t": -1.0}
 route = {"key": None, "goal": None, "waypoints": deque(), "retry": 0.0,
          "best": math.inf, "progress": 0.0, "next_limit": 0.0}
+zone_loot = {"id": None, "until": 0.0, "retry": 0.0, "hit_until": 0.0}
+ZONE_LOOT_S = 1.0
+ZONE_LOOT_RESERVE_S = 4.0
 
 WEAPON_RANK = {"laser": 0, "lightning": 1, "mortar": 2}  # lower = preferred
 # Upgrade ranking by id (higher = better), from the real hello.config.upgrades list.
@@ -1189,24 +1192,104 @@ def safe_zone_route(o, me, enemies, cx, cy, radius):
     return best_dir
 
 
-def take_nearby_weapon(o, me, act, held):
-    """Add a pickup command for an in-range weapon while entering the zone."""
-    if held[1] is not None or "take" in act:
-        return
+def zone_weapon_detour(o, me, act, held, goal, walk_speed, distance_to_zone):
+    """Take an in-range weapon or briefly walk to one during safe zone travel."""
+    now = o["t"]
+    target = zone_loot["id"]
+    # An interrupted approach should not switch straight to another pickup.
+    # A validated approach below restores the target with its original deadline.
+    if target is not None:
+        zone_loot.update(id=None, retry=now + 3.0)
+    if (goal is None or held[1] is not None or not me["grounded"]
+            or now < zone_loot["hit_until"]
+            or (target is None and now < zone_loot["retry"])):
+        return None
+
+    pickups = o.get("pickups", ())
+    if not pickups:
+        return None
+    z = o["zone"]
+    slack = z["shrink_end"] - now - distance_to_zone / walk_speed - ZONE_LOOT_RESERVE_S
+    if slack <= 0:
+        return None
+    start = tuple(me["pos"][:2])
+    pz = me["pos"][2]
     pickup_range = CFG.get("loot", {}).get("pickup_radius", 4.0)
-    px, py, pz = me["pos"]
-    best = None
-    for pickup in o.get("pickups", ()):
-        if pickup["kind"] in held or ignore.get(("p", pickup["id"]), 0) > o["t"]:
+    threats = [(m["pos"][:2], 65.0 if m["kind"] == "mech" else 45.0)
+               for m in o["mechs"] if m["id"] != me["id"]]
+    if any(math.dist(start, pos) < radius for pos, radius in threats):
+        return None
+    gone = {e["id"] for e in o.get("events", ())
+            if e.get("type") == "take_failed" and e.get("reason") == "gone"}
+    candidates = []
+    for pickup in pickups:
+        pid = pickup["id"]
+        if ((target is not None and pid != target) or pid in gone
+                or pickup["kind"] in held or ignore.get(("p", pid), 0) > now):
             continue
-        x, y, z = pickup["pos"]
-        distance = math.hypot(x - px, y - py)
-        if distance <= pickup_range and abs(z - pz) <= 4.0:
-            candidate = distance, WEAPON_RANK.get(pickup["kind"], 3), pickup["id"]
-            if best is None or candidate < best:
-                best = candidate
-    if best is not None:
-        act["take"] = best[2]
+        distance = math.dist(start, pickup["pos"][:2])
+        candidates.append((distance, WEAPON_RANK.get(pickup["kind"], 3), pid, pickup["pos"]))
+    candidates.sort()
+    for distance, _, pid, pos in candidates:
+        if distance <= pickup_range and abs(pos[2] - pz) <= 4.0:
+            act["take"] = pid
+            zone_loot["id"] = target
+            return None
+
+    remaining = ZONE_LOOT_S if target is None else zone_loot["until"] - now
+    approach_range = max(0.0, pickup_range - 0.35)
+    max_walk = remaining * walk_speed * 0.85
+    look = min(18.0, math.dist(start, goal))
+    if (not candidates or remaining <= 0 or not MAP["ok"] or look < 1.0
+            or candidates[0][0] > max_walk + approach_range):
+        return None
+    if abs(ground(*start) - pz) > 0.6:
+        return None  # use the terrain route only from ground level, not a roof
+    rejoin = tuple(start[i] + look * act["move"][i] for i in range(2))
+    if not walkable_segment(start, rejoin, resolution=0.8):
+        return None  # leave obstacle routing to the zone planner
+
+    # Check the approaching edge at the end of the pickup window. The circle
+    # contracts linearly from the current observation during the shrink.
+    shrink_now = max(now, z["shrink_start"])
+    future_time = min(z["shrink_end"], now + remaining + 0.3)
+    fraction = 0.0
+    if future_time > shrink_now:
+        fraction = (future_time - shrink_now) / (z["shrink_end"] - shrink_now)
+    future_center = tuple(a + fraction * (b - a) for a, b in zip(z["center"], goal))
+    future_radius = z["radius"] + fraction * (z["next_radius"] - z["radius"]) - 2.0
+    if max(math.dist(start, future_center), math.dist(rejoin, future_center)) > future_radius:
+        return None
+
+    best = None
+    for distance, rank, pid, pos in candidates:
+        if distance <= pickup_range:
+            continue  # already within horizontal range but above or below us
+        to_range = distance - approach_range
+        if to_range > max_walk:
+            break
+        direction = tuple((pos[i] - start[i]) / distance for i in range(2))
+        entry = tuple(start[i] + to_range * direction[i] for i in range(2))
+        extra_time = max(0.0, to_range + math.dist(entry, rejoin) - look) / walk_speed
+        if (extra_time > min(ZONE_LOOT_S, slack)
+                or math.dist(entry, goal) > math.dist(start, goal) + 1.0
+                or math.dist(entry, future_center) > future_radius
+                or any(min(segment_separation(start, entry, point),
+                           segment_separation(entry, rejoin, point)) < radius
+                       for point, radius in threats)
+                or not walkable_segment(start, entry, resolution=0.8)
+                or abs(pos[2] - ground(*entry)) > 3.5
+                or not walkable_segment(entry, rejoin, resolution=0.8)):
+            continue
+        candidate = (extra_time, distance, rank, pid, direction)
+        if best is None or candidate < best:
+            best = candidate
+    if best is None:
+        return None
+    zone_loot["id"] = best[3]
+    if target is None:
+        zone_loot["until"] = now + ZONE_LOOT_S
+    return best[4]
 
 
 def decide(o):
@@ -1222,6 +1305,8 @@ def decide(o):
     now = o["t"]
     hit_now = any(e.get("type") == "damaged" and e.get("by") is not None
                   for e in o.get("events", []))
+    if hit_now:
+        zone_loot["hit_until"] = now + 2.0
     fleeing = False
     want_up = False
 
@@ -1232,6 +1317,8 @@ def decide(o):
     route_key = "zone"
     zd = math.hypot(cx - px, cy - py) or 1.0
     inside = me["in_zone"] and zd < 0.85 * z["next_radius"]
+    if inside:
+        zone_loot["id"] = None
     if (not inside) or zd > 0.5 * z["next_radius"]:
         act["move"] = [(cx - px) / zd, (cy - py) / zd]
     else:
@@ -1364,16 +1451,19 @@ def decide(o):
     if evade is not None:
         act["move"] = evade
         goal = None
-    desired = act["move"]
-    act["move"] = move_with_route(o, me, desired, goal, route_key, enemies)
+    detour = None
+    if not inside:
+        detour = zone_weapon_detour(o, me, act, held, None if urgent else goal,
+                                    walk_speed, distance_to_zone)
+    desired = act["move"] if detour is None else list(detour)
+    act["move"] = (move_with_route(o, me, desired, goal, route_key, enemies)
+                   if detour is None else desired)
     mobility(o, me, act, desired, want_up, fleeing, evade is not None,
              jump_dodge, urgent and route_key == "zone")
     if enemies:
         fire_weapons(me, act, t, allow_fire=not (avoid and dist >= 40),
                      allow_charge=evade is None and not (fleeing or urgent or hit_now))
     reload_gun(me, act)
-    if route_key == "zone" and not inside:
-        take_nearby_weapon(o, me, act, held)
 
     return act
 
@@ -1387,7 +1477,7 @@ def main():
     CFG = hello.get("config", {})
     RNG = random.Random(hello.get("seed", 0))
     load_map(hello)
-    send({"type": "ready", "name": "mech-royale-v8l"})
+    send({"type": "ready", "name": "mech-royale-v8m"})
 
     while True:
         m = q.get()
